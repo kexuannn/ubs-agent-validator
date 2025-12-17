@@ -1,0 +1,29 @@
+[project]
+name = "algotracer"
+version = "0.1.0"
+description = "Agent-based static and structural analysis for ML pipelines"
+authors = [{ name = "AlgoTracer Authors" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+reporting = []
+
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = [
+    "algotracer",
+    "algotracer.ingest",
+    "algotracer.analysis",
+    "algotracer.reasoning",
+    "algotracer.reporting",
+]
+
+[tool.setuptools.package-data]
+algotracer = ["py.typed"]
+
