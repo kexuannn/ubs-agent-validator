@@ -9,39 +9,53 @@ python -m algotracer.cli <command> [options]
 ## Commands
 
 ### analyze
-Analyze one or more Python files/directories and emit a Markdown report (`algotrace-report.md`).
+Analyze a repository and write the call graph into Memgraph.
 
 Required:
-- `paths...` — one or more files or directories to analyze.
+- `repo_path` — repository root to analyze.
 
 Common options:
-- `--report-dir PATH` — where to write the report (default: `reports`).
+- `--repo-id ID` — override repo_id (default: repo folder name).
 - `--include-tests` — include files under `tests/` (default: skip).
+- `--memgraph-host HOST` — Memgraph host (default: env or 127.0.0.1).
+- `--memgraph-port PORT` — Memgraph port (default: env or 7687).
+- `--memgraph-user USER` — Memgraph username (default: env).
+- `--memgraph-password PASS` — Memgraph password (default: env).
 
-Entrypoint detection:
-- Rules mode (default): `--entrypoints name1 name2 ...` (default: `fit predict`).
-- Auto mode: `--auto-entrypoints` (ignores `--entrypoints`), `--top-k-entrypoints N` (default: 1).
-- Tuning: `--add-sklearn-defaults` (adds sklearn-ish heuristics in rules mode); `--no-base-requires-name-match` (let base-class hints apply without name match).
+Notes:
+- Notebooks (`.ipynb`) are converted to temporary `.py` files under `.algotracer_notebooks/` during analysis.
 
-Tracing controls:
-- `--max-depth N` — DFS depth (default: 3).
-- `--max-paths N` — cap number of paths per entrypoint (default: unlimited).
-- `--max-expansions N` — cap neighbor expansions per entrypoint (default: unlimited).
-- `--max-examples N` — number of example paths to show (default: 10).
+### explain
+Explain a function neighborhood from Memgraph.
+
+Required:
+- `repo_path` — repository root (used for path resolution).
+- One of:
+  - `--id <function_id>` (preferred)
+  - `--name <qualname>` (optionally with `--file <path>`)
+
+Common options:
+- `--depth-up N` — caller traversal depth (default: 2).
+- `--depth-down N` — callee traversal depth (default: 2).
+- `--max-nodes N` — max nodes returned (default: 200).
+- `--max-edges N` — max edges returned (default: 400).
+- `--max-paths N` — max paths sampled per direction (default: 200).
+- `--debug-subgraph PATH` — write `subgraph.json` for debugging.
+- `--no-llm` — disable LLM usage (deterministic summary only).
 
 ## Examples
 
-- Rules mode with defaults:
+- Build graph for a repo:
   ```bash
-  python -m algotracer.cli analyze src --report-dir /tmp/algotrace
+  python -m algotracer.cli analyze path/to/repo --repo-id my-repo
   ```
 
-- Auto entrypoints, trace top 5, include tests:
+- Explain a function by file + name:
   ```bash
-  python -m algotracer.cli analyze src --auto-entrypoints --top-k-entrypoints 5 --include-tests --report-dir /tmp/algotrace
+  python -m algotracer.cli explain path/to/repo --file src/model.py --name Class.fit
   ```
 
-- Custom entrypoints and deeper trace:
+- Explain by stable id:
   ```bash
-  python -m algotracer.cli analyze src --entrypoints main run serve --max-depth 4 --max-paths 500 --report-dir /tmp/algotrace
+  python -m algotracer.cli explain path/to/repo --id stable:sym:src/model.py:Class.fit
   ```

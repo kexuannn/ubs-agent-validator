@@ -30,6 +30,7 @@ def helper(x):
 
     module = parse_module(target)
     assert module.imports
+    assert any(imp.name == "numpy" and imp.kind == "import" for imp in module.imports)
     assert any(cls.name == "LinearModel" for cls in module.classes)
     assert any(func.name == "fit" for cls in module.classes for func in cls.methods)
     assert any(func.name == "helper" for func in module.functions)

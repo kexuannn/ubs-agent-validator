@@ -1,189 +1,144 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 import hashlib
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Sequence
+from typing import Iterable, List
 
-from algotracer.ingest.ast_parser import ModuleInfo, parse_python_files
-from algotracer.analysis.deps import (
-    DependencyGraph,
-    build_dependency_graph,
-    summarize_callers,
+from algotracer.graph.builder import GraphBuildConfig, write_graph
+from algotracer.graph.neighborhood import NeighborhoodConfig, fetch_neighborhood
+from algotracer.graph.resolver import (
+    disambiguate,
+    normalize_path,
+    resolve_by_id,
+    resolve_by_name,
+    resolve_by_path_and_name,
 )
-from algotracer.analysis.entrypoints import (
-    EntryPoint,
-    EntryPointRules,
-    find_entrypoints,
-    find_entrypoints_auto,
-)
-from algotracer.analysis.trace import TraceSummary, trace_and_summarize
-from algotracer.reporting.renderer import MarkdownReport, render_markdown_report
-from algotracer.reasoning.flow_explainer import build_gemini_llm
+from algotracer.ingest.ast_parser import parse_python_files
+from algotracer.memgraph.client import MemgraphConfig, clear_repo, connect_memgraph, ensure_schema
+from algotracer.reasoning.explainer import EvidencePack, build_gemini_llm, explain
 
 
-# -------------------------------------------------------------------
-# Config
-# -------------------------------------------------------------------
-
-@dataclass
-class PipelineConfig:
-    sources: Sequence[Path]
-    report_dir: Path
-
-    # Entrypoint detection
-    entrypoint_names: Sequence[str] | None = ("fit", "predict", "transform")
-    auto_entrypoints: bool = False
-
-    # Rules-based tuning
-    add_sklearn_defaults: bool = False
-    base_requires_name_match: bool = True
-
-    # Source selection
+@dataclass(frozen=True)
+class AnalyzeConfig:
+    repo_path: Path
+    repo_id: str
     include_tests: bool = False
 
-    # Tracing controls
-    max_depth: int = 3
-    max_paths: int | None = 2000
-    max_expansions: int | None = 20000
-    max_examples: int = 10
 
-    # How many entrypoints to trace
-    top_k_entrypoints: int = 1
+@dataclass(frozen=True)
+class ExplainConfig:
+    repo_path: Path
+    repo_id: str
+    function_id: str | None = None
+    function_name: str | None = None
+    function_file: Path | None = None
+    depth_up: int = 2
+    depth_down: int = 2
+    max_nodes: int = 200
+    max_edges: int = 400
+    max_paths: int = 200
+    debug_subgraph_path: Path | None = None
+    use_llm: bool = True
 
-
-# -------------------------------------------------------------------
-# Artifacts
-# -------------------------------------------------------------------
-
-@dataclass
-class PipelineArtifacts:
-    modules: List[ModuleInfo] = field(default_factory=list)
-    dependency_graph: DependencyGraph | None = None
-
-    entrypoints: List[EntryPoint] = field(default_factory=list)
-    traces: Dict[str, TraceSummary] = field(default_factory=dict)
-    callers: Dict[str, List[str]] = field(default_factory=dict)
-
-    report: MarkdownReport | None = None
-
-
-# -------------------------------------------------------------------
-# Pipeline
-# -------------------------------------------------------------------
 
 class AlgoTracerPipeline:
-    def __init__(self, config: PipelineConfig):
-        self.config = config
-        self.artifacts = PipelineArtifacts()
-        self._llm = None
-        self._notebook_cache = Path(".algotracer_notebooks")
+    def __init__(self, memgraph_config: MemgraphConfig):
+        self.memgraph_config = memgraph_config
+        self._notebook_cache: Path | None = None
 
-    # ------------------------------------------------------------
-    # Main pipeline
-    # ------------------------------------------------------------
-
-    def run(self) -> PipelineArtifacts:
-        python_files = list(self._iter_source_files())
+    def analyze(self, config: AnalyzeConfig) -> None:
+        repo_path = config.repo_path
+        self._notebook_cache = repo_path / ".algotracer_notebooks"
+        python_files = list(self._iter_python_files(repo_path, include_tests=config.include_tests))
         print(f"AlgoTracer: collected {len(python_files)} Python files.")
 
-        print("AlgoTracer: parsing modules...")
-        self.artifacts.modules = parse_python_files(python_files)
-        print(f"AlgoTracer: parsed {len(self.artifacts.modules)} modules.")
+        modules = parse_python_files(python_files)
+        print(f"AlgoTracer: parsed {len(modules)} modules.")
 
-        print("AlgoTracer: building dependency graph...")
-        graph = build_dependency_graph(self.artifacts.modules)
-        self.artifacts.dependency_graph = graph
-        print(f"AlgoTracer: graph nodes={len(graph.nodes)}, edges={sum(len(v) for v in graph.edges.values())}.")
+        mg = connect_memgraph(self.memgraph_config)
+        ensure_schema(mg)
+        clear_repo(mg, config.repo_id)
 
-        # Entrypoints
-        if self.config.auto_entrypoints or not self.config.entrypoint_names:
-            print("AlgoTracer: detecting entrypoints (auto mode)...")
-            self.artifacts.entrypoints = find_entrypoints_auto(
-                self.artifacts.modules,
-                graph,
-                top_k=max(self.config.top_k_entrypoints, 10),
-            )
-        else:
-            print("AlgoTracer: detecting entrypoints (rules mode)...")
-            rules = EntryPointRules(
-                base_requires_name_match=self.config.base_requires_name_match
-            )
-            self.artifacts.entrypoints = find_entrypoints(
-                self.artifacts.modules,
-                names=set(self.config.entrypoint_names),
-                rules=rules,
-                add_sklearn_defaults=self.config.add_sklearn_defaults,
-            )
-
-        if not self.artifacts.entrypoints:
-            raise RuntimeError("No entrypoints detected.")
-
-        print(f"AlgoTracer: detected {len(self.artifacts.entrypoints)} entrypoints.")
-
-        selected = self.artifacts.entrypoints[: self.config.top_k_entrypoints]
-        print(f"AlgoTracer: tracing {len(selected)} entrypoints (max_depth={self.config.max_depth}).")
-
-        self.artifacts.traces = trace_and_summarize(
-            graph,
-            selected,
-            max_depth=self.config.max_depth,
-            max_paths=self.config.max_paths,
-            max_expansions=self.config.max_expansions,
-            max_examples=self.config.max_examples,
+        write_graph(
+            mg=mg,
+            modules=modules,
+            config=GraphBuildConfig(repo_id=config.repo_id, repo_root=repo_path),
         )
 
-        print("AlgoTracer: collecting callers...")
-        self.artifacts.callers = {
-            ep.sym_id: summarize_callers(graph, ep.sym_id)
-            for ep in selected
-        }
+        print(f"AlgoTracer: graph written to Memgraph for repo_id={config.repo_id}.")
 
-        self.config.report_dir.mkdir(parents=True, exist_ok=True)
-        print(f"AlgoTracer: rendering report to {self.config.report_dir} ...")
+    def explain(self, config: ExplainConfig) -> str:
+        mg = connect_memgraph(self.memgraph_config)
 
-        self.artifacts.report = render_markdown_report(
-            modules=self.artifacts.modules,
-            graph=graph,
-            entrypoints=self.artifacts.entrypoints,
-            traces=self.artifacts.traces,
-            callers=self.artifacts.callers,
-            output_dir=self.config.report_dir,
-            llm=self._get_llm(),
+        target = None
+        if config.function_id:
+            target = resolve_by_id(mg, config.repo_id, config.function_id)
+        elif config.function_file and config.function_name:
+            stable_path = normalize_path(config.function_file, config.repo_path)
+            target = resolve_by_path_and_name(mg, config.repo_id, stable_path, config.function_name)
+        elif config.function_name:
+            candidates = resolve_by_name(mg, config.repo_id, config.function_name)
+            target = disambiguate(candidates)
+
+        if target is None:
+            raise RuntimeError("Unable to resolve target function. Provide --id or --file/--name.")
+
+        neighborhood = fetch_neighborhood(
+            mg=mg,
+            repo_id=config.repo_id,
+            func_id=target.id,
+            config=NeighborhoodConfig(
+                depth_up=config.depth_up,
+                depth_down=config.depth_down,
+                max_nodes=config.max_nodes,
+                max_edges=config.max_edges,
+                max_paths=config.max_paths,
+            ),
         )
 
-        return self.artifacts
+        evidence = EvidencePack(
+            target=neighborhood.target,
+            upstream={
+                "depth": config.depth_up,
+                "callers": neighborhood.callers,
+                "paths": neighborhood.upstream_paths,
+            },
+            downstream={
+                "depth": config.depth_down,
+                "callees": neighborhood.callees,
+                "paths": neighborhood.downstream_paths,
+            },
+            externals=neighborhood.externals,
+            edges=neighborhood.edges,
+            nodes=neighborhood.nodes,
+        )
 
-    # ------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------
+        if config.debug_subgraph_path is not None:
+            payload = {"nodes": neighborhood.nodes, "edges": neighborhood.edges}
+            config.debug_subgraph_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True),
+                encoding="utf-8",
+            )
 
-    def _include_path(self, path: Path) -> bool:
-        if not self.config.include_tests and "tests" in path.parts:
-            return False
-        if self._notebook_cache in path.parents:
-            return False
-        return True
+        llm = build_gemini_llm() if config.use_llm else None
+        return explain(evidence, llm=llm)
 
-    def _iter_source_files(self) -> Iterable[Path]:
-        for path in self.config.sources:
-            if path.is_dir():
-                for p in path.rglob("*.py"):
-                    if self._include_path(p):
-                        yield p
-                for nb in path.rglob("*.ipynb"):
-                    if self._include_path(nb):
-                        converted = self._convert_notebook(nb)
-                        if converted:
-                            yield converted
-            elif path.suffix == ".py":
-                if self._include_path(path):
-                    yield path
-            elif path.suffix == ".ipynb":
-                converted = self._convert_notebook(path)
-                if converted:
-                    yield converted
+    def _iter_python_files(self, repo_path: Path, *, include_tests: bool) -> Iterable[Path]:
+        for path in repo_path.rglob("*.py"):
+            if not include_tests and "tests" in path.parts:
+                continue
+            if self._notebook_cache in path.parents:
+                continue
+            yield path
+
+        for nb in repo_path.rglob("*.ipynb"):
+            if not include_tests and "tests" in nb.parts:
+                continue
+            converted = self._convert_notebook(nb)
+            if converted:
+                yield converted
 
     def _convert_notebook(self, path: Path) -> Path | None:
         try:
@@ -193,45 +148,30 @@ class AlgoTracerPipeline:
             return None
 
         code_blocks: List[str] = []
-
         for cell in data.get("cells", []):
             if cell.get("cell_type") != "code":
                 continue
-
             src = cell.get("source", [])
             if isinstance(src, str):
                 src = [src]
-
-            cleaned = []
+            cleaned: List[str] = []
             for line in src:
                 stripped = line.lstrip()
                 if stripped.startswith("%") or stripped.startswith("!") or stripped.startswith("%%"):
                     cleaned.append(f"# NOTE: skipped notebook magic: {line}")
                 else:
                     cleaned.append(line)
-
             code_blocks.append("".join(cleaned))
 
         if not code_blocks:
             print(f"AlgoTracer: notebook {path} has no usable code cells; skipping.")
             return None
 
+        if self._notebook_cache is None:
+            self._notebook_cache = Path(".algotracer_notebooks")
         self._notebook_cache.mkdir(parents=True, exist_ok=True)
-
         h = hashlib.sha1(str(path).encode("utf-8")).hexdigest()[:12]
         dest = self._notebook_cache / f"{path.stem}.{h}.py"
         dest.write_text("\n\n".join(code_blocks), encoding="utf-8")
-
         print(f"AlgoTracer: converted notebook {path} -> {dest}")
         return dest
-
-    def _get_llm(self):
-        if self._llm is not None:
-            return self._llm
-        try:
-            self._llm = build_gemini_llm()
-            print("AlgoTracer: LLM enabled via Gemini.")
-        except Exception:
-            self._llm = None
-            print("AlgoTracer: LLM unavailable; using heuristic reasoning.")
-        return self._llm

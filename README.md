@@ -1,50 +1,64 @@
 # AlgoTracer
 
-AlgoTracer is an agent-based static + structural analyzer for Python projects. It ingests code, builds dependency/entrypoint traces, and emits Markdown reports with callers, downstream paths, and reasoning (LLM-backed if configured).
+AlgoTracer builds a call graph for a Python repository directly in Memgraph, then explains the neighborhood around a specific function using only that graph evidence.
 
 ## What it does
-- **Parse**: Walk Python files; capture imports, classes, functions, calls, decorators via AST.
-- **Graph**: Build mod/sym/ext graphs with forward + reverse edges and intra-module sym→sym resolution.
-- **Entrypoints**: Detect likely entrypoints (rules or auto), rank them, and trace downstream paths.
-- **Reasoning**: Summarize traces heuristically or via Gemini LLM (if available).
-- **Report**: Emit `algotrace-report.md` with modules, entrypoints, callers, downstream paths, and reasoning.
+- **Parse**: Walk Python files (and notebooks), capture imports, classes, functions, calls, decorators via AST.
+- **Graph (Memgraph-first)**: Write Repo/Module/Function/External nodes + CALLS edges into Memgraph.
+- **Resolve**: Pick a function by stable id or file/name and disambiguate if needed.
+- **Neighborhood**: Fetch bounded upstream/downstream subgraphs with caps.
+- **Explain**: Generate a short explanation grounded in that subgraph (LLM optional; deterministic fallback).
 
 ## Quickstart
+
+1) **Start Memgraph via Docker (no auth):**
 ```bash
-python -m algotracer.cli analyze path/to/code \
-  --report-dir /tmp/algotrace \
-  --auto-entrypoints \
-  --top-k-entrypoints 5
+docker run -it --rm \
+  -p 7687:7687 -p 3000:3000 \
+  memgraph/memgraph-platform
 ```
-See `instructions.md` for full CLI options.
+This exposes Bolt on `127.0.0.1:7687`. Adjust ports as needed.
 
-## Pipeline (Milestone 1)
-1) Collect source files (optionally skip tests)
-2) Parse AST → ModuleInfo
-3) Build dependency graph (mod/sym/ext nodes, reverse edges, intra-module resolution)
-4) Detect entrypoints (rules or auto)
-5) Trace downstream flows and gather callers
-6) Reason over traces (LLM if available; otherwise heuristic)
-7) Render Markdown report
+2) **Install AlgoTracer (editable):**
+```bash
+pip install -e .
+```
 
-## Configuration highlights
-- **Entrypoints**: rules mode (`--entrypoints ...` with optional `--add-sklearn-defaults`) or auto mode (`--auto-entrypoints`, `--top-k-entrypoints N`).
-- **Tracing**: `--max-depth`, `--max-paths`, `--max-expansions`, `--max-examples`.
-- **LLM**: set `GEMINI_API_KEY` and install `google-generativeai` to enable Gemini-backed reasoning; otherwise falls back to deterministic summaries.
-- **Notebooks**: `.ipynb` files are converted automatically; code cells are extracted into temp `.py` files under `.algotracer_notebooks/`.
+3) **Analyze a repo (build graph in Memgraph):**
+```bash
+algotracer analyze path/to/repo --repo-id my-repo
+```
+
+4) **Explain a function:**
+```bash
+algotracer explain path/to/repo \
+  --name Class.fit \
+  --file src/model.py
+```
+
+Memgraph connection is configurable via environment variables:
+- `MEMGRAPH_HOST` (default `127.0.0.1`)
+- `MEMGRAPH_PORT` (default `7687`)
+- `MEMGRAPH_USER`, `MEMGRAPH_PASSWORD` (optional)
+
+You can also override via CLI flags: `--memgraph-host/--memgraph-port/--memgraph-user/--memgraph-password`.
+
+## CLI
+Run `python -m algotracer.cli --help` for full options.
 
 ## Project layout
 - `src/algotracer/ingest/ast_parser.py` — AST extraction (imports/classes/functions/calls/decorators).
-- `src/algotracer/analysis/deps.py` — dependency graph (forward + reverse edges, intra-module resolution).
-- `src/algotracer/analysis/entrypoints.py` — rules + auto entrypoint detection.
-- `src/algotracer/analysis/trace.py` — DFS tracing, summaries, path limits.
-- `src/algotracer/reasoning/flow_explainer.py` — reasoning (heuristic or Gemini-backed).
-- `src/algotracer/reporting/renderer.py` — Markdown report (entrypoints, callers, paths, reasoning).
-- `src/algotracer/pipeline.py` — orchestrator; logs pipeline stages.
+- `src/algotracer/graph/builder.py` — build and write the Memgraph graph.
+- `src/algotracer/graph/resolver.py` — resolve target functions by id/path/name.
+- `src/algotracer/graph/neighborhood.py` — traverse upstream/downstream neighborhood.
+- `src/algotracer/memgraph/client.py` — Memgraph connection + schema helpers.
+- `src/algotracer/reasoning/explainer.py` — explanation prompt + deterministic fallback.
+- `src/algotracer/pipeline.py` — analyze/explain orchestration.
 - `src/algotracer/cli.py` — CLI entrypoint.
-- `instructions.md` — detailed CLI usage examples.
 
 ## Notes
 - Default behavior skips tests; add `--include-tests` to include them.
-- If no LLM key is present, reports still render with heuristic reasoning.
-- Reports are written to the specified `--report-dir` (default `reports`).
+- Notebooks (`.ipynb`) are converted to temp `.py` files under `.algotracer_notebooks/` before parsing.
+- If no LLM key is present, explanations fall back to deterministic summaries.
+- Multiple repos can coexist in Memgraph by using distinct `repo_id` values.
+- If Memgraph is not running, `analyze`/`explain` will fail to connect; start the Docker container first.
