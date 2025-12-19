@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     explain.add_argument("--max-paths", type=int, default=200, help="Max paths to sample per direction (default: 200)")
     explain.add_argument("--debug-subgraph", type=Path, default=None, help="Write subgraph JSON to this path")
     explain.add_argument("--no-llm", action="store_true", help="Disable LLM usage")
+    explain.add_argument("--output", type=Path, default=None, help="Write explanation markdown to this file (default: reports/explanation.md)")
     _add_memgraph_flags(explain)
 
     return parser
@@ -100,6 +101,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_paths=args.max_paths,
                 debug_subgraph_path=args.debug_subgraph,
                 use_llm=not args.no_llm,
+                output_path=args.output,
             )
         )
         print(explanation)

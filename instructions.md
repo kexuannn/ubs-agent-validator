@@ -52,7 +52,7 @@ Common options:
 
 - Explain a function by file + name:
   ```bash
-  python -m algotracer.cli explain path/to/repo --file src/model.py --name Class.fit
+  python -m algotracer.cli explain path/to/repo --file src/model.py --name Class.fit --output reports/explanation.md
   ```
 
 - Explain by stable id:
