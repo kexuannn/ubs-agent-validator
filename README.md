@@ -33,7 +33,8 @@ algotracer analyze path/to/repo --repo-id my-repo
 ```bash
 algotracer explain path/to/repo \
   --name Class.fit \
-  --file src/model.py
+  --file src/model.py \
+  --output reports/explanation.md
 ```
 
 Memgraph connection is configurable via environment variables:

@@ -41,6 +41,7 @@ class ExplainConfig:
     max_paths: int = 200
     debug_subgraph_path: Path | None = None
     use_llm: bool = True
+    output_path: Path | None = None
 
 
 class AlgoTracerPipeline:
@@ -122,8 +123,21 @@ class AlgoTracerPipeline:
                 encoding="utf-8",
             )
 
-        llm = build_gemini_llm() if config.use_llm else None
-        return explain(evidence, llm=llm)
+        llm = None
+        if config.use_llm:
+            try:
+                llm = build_gemini_llm()
+                print("AlgoTracer: LLM enabled (Gemini).")
+            except Exception as exc:
+                print(f"AlgoTracer: LLM unavailable ({type(exc).__name__}: {exc}); using deterministic summary.")
+
+        result = explain(evidence, llm=llm)
+
+        output_path = config.output_path or (config.repo_path / "reports" / "explanation.md")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result, encoding="utf-8")
+
+        return result
 
     def _iter_python_files(self, repo_path: Path, *, include_tests: bool) -> Iterable[Path]:
         for path in repo_path.rglob("*.py"):
