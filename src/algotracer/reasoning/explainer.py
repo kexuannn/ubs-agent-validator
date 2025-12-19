@@ -102,8 +102,6 @@ def _find_virtual_calls_from_target(
             continue
         s = e.get("start") or e.get("src")
         d = e.get("end") or e.get("dst")
-        # we expect neighborhood._rel_to_dict to have normalized src/dst already,
-        # but this fallback makes it slightly more robust.
         if isinstance(s, str) and isinstance(d, str) and s == target_id:
             out.append((s, d))
     return out
@@ -300,11 +298,26 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         for p in upstream_paths[:5]:
             lines.append(f"- `{p}`")
         lines.append("")
+
     if downstream_paths:
-        lines.append("Evidence: example downstream paths")
-        for p in downstream_paths[:5]:
-            lines.append(f"- `{p}`")
-        lines.append("")
+        # Hide paths that only go through VCs we consider "resolved"
+        resolved_vc_ids = set(vc_ids_from_target) - set(unresolved_vc_ids)
+
+        def _path_has_resolved_vc(path: str) -> bool:
+            return any(vc_id in path for vc_id in resolved_vc_ids)
+
+        filtered_downstream = [
+            p for p in downstream_paths if not _path_has_resolved_vc(p)
+        ]
+
+        if filtered_downstream:
+            lines.append(
+                "Evidence: example downstream paths "
+                "(functions plus any unresolved dynamic calls)"
+            )
+            for p in filtered_downstream[:5]:
+                lines.append(f"- `{p}`")
+            lines.append("")
 
     return "\n".join(lines).strip()
 
