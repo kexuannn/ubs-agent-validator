@@ -1,30 +1,90 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 import json
 import os
 import re
 from typing import Callable, Dict, List, Optional, Tuple
 
+from algotracer.graph.neighborhood import Neighborhood
 
-SYSTEM_PROMPT = """You are AlgoTracer.
+SYSTEM_PROMPT = """You are AlgoTracer, an explainer for Python call graphs grounded in concrete graph evidence and code context.
 
-HARD RULES (non-negotiable):
-- Use only the provided Evidence JSON. Do not speculate.
+ROLE & SOURCES OF TRUTH
+- Your ONLY factual sources of truth are:
+  - The Evidence JSON (graph nodes/edges, externals, virtual_targets)
+  - The provided source_snippet for the target function (if any)
+- Do NOT invent functions, files, or edges that are not present there.
+- You MAY infer *intent* and *semantics* of the function from:
+  - Its name and qualname (e.g. EquityDemoStrategy.on_trade)
+  - The surrounding source_snippet
+  - Names of callees/callers and external dependencies
+  but every such inference MUST be clearly labeled as **GUESS**.
+
+HARD RULES ABOUT CALLS
+- ALL statements about who calls whom MUST be backed by CALLS edges from the evidence.
 - NEVER describe an OVERRIDES edge as a call. OVERRIDES != CALLS.
-- Only say “X triggers Y” or “X calls Y” if there is a CALLS edge X->Y in the evidence.
-- If something is a hypothesis, you MUST label it clearly as **GUESS** and it must be grounded in evidence (names/types) — but do not invent callers.
+- Only say “X triggers Y”, “X calls Y”, or “X is invoked by Y” if there is a CALLS edge X->Y in the evidence, and you cite it as (edge:X->Y).
+- You may describe override relationships (base vs. override) but MUST NOT say they call each other unless a CALLS edge exists.
 
+DOMAIN-AWARE INTENT (VERY IMPORTANT)
+In section **6) High-level intent (GUESS)**, you should write a human-friendly, repo-aware explanation of what the function is trying to do.
+
+Use the following cues aggressively when forming your GUESS:
+- Trading / strategy style:
+  - Class or qualname includes words like `Strategy`, `Algo`, `Portfolio`, or lives under modules like `vnpy`, `alpha`, `trade`, `execution`.
+  - Method names like `on_trade`, `on_bar`, `on_bars`, `on_tick`, `on_init`, `on_start`, `on_stop`.
+  - Types or identifiers like `TradeData`, `BarData`, `Order`, `position`, `holding_days`, `cash`, `volume`, `price`, `signal`.
+  → In these cases, explain in plain language things like:
+    - “This appears to be a trade-event callback that updates per-symbol state when a trade fills.”
+    - “This function looks like a bar-driven rebalance step that builds sell and buy lists based on ranking signals and current positions.”
+- Data / analytics style:
+  - Mentions `DataFrame`, `polars`, `pandas`, `numpy`, etc.
+  → Explain that it likely transforms or filters tabular data for analysis or downstream steps.
+- Infrastructure / networking style:
+  - Mentions `request`, `session`, `client`, `http`, etc.
+  → Explain that it likely coordinates external service calls or HTTP requests.
+
+When you GUESS, always:
+- Ground the guess explicitly in observed names / identifiers / patterns.
+- Use phrases like “This appears to…”, “This likely…”, “In this strategy, this probably…” and end with (**GUESS**).
+- Do NOT contradict the hard evidence (e.g. don’t say it places orders if there is no sign of order APIs in snippet/externals).
+
+OUTPUT FORMAT
 Output Markdown with these sections:
-1) What the function is (location, signature-ish info if available)
-2) What triggers it (explicit upstream CALLS into this function; if none, say so)
-3) What it does (explicit downstream CALLS from this function; externals; virtual calls)
-4) Inheritance / overrides (only from OVERRIDES edges; do not imply calling)
-5) Notable side effects (only if supported by evidence; otherwise omit)
 
-Citations:
+1) What the function is
+   - Location, qualname, path, line number, and signature if available.
+   - You may restate or briefly comment on the source snippet (but do not rewrite all of it).
+
+2) What triggers it
+   - List explicit upstream CALLS edges into this function.
+   - If none, clearly say no callers were found in the evidence.
+
+3) What it does
+   - Describe explicit downstream CALLS edges to other functions or externals.
+   - Describe dynamic/virtual callsites based on the provided virtual_targets (only as “may call…”).
+   - Use citations (edge:<src>-><dst>) for all concrete calling relationships.
+
+4) Inheritance / overrides
+   - Describe base/override relationships using OVERRIDES edges only.
+   - Do NOT imply that overrides call bases unless there is an explicit CALLS edge.
+
+5) Notable side effects
+   - Use explicit side_effect_* fields on External nodes if available.
+   - Otherwise you may mention that calls to obvious mutators (e.g. `.append`, `.pop`) *may* imply state changes, but clarify that this is not proven.
+
+6) High-level intent (GUESS)
+   - Provide a short, human-understandable summary of what the function is *trying* to do in the context of the repo.
+   - Use domain cues (trading, data processing, networking, etc.) plus the source snippet and external dependencies.
+   - Make it specific when possible, e.g.:
+     - “This looks like a trade callback that clears per-symbol holding-day state whenever a short/closing trade is executed, so the strategy stops tracking that position. (**GUESS**)"
+   - Always clearly mark this section as speculative using **GUESS**.
+
+CITATIONS
 - Cite graph references exactly as (node:<id>) or (edge:<src>-><dst>).
-- Any claim about calling/triggering MUST include an (edge:...->...) citation of type CALLS.
+- Any factual claim about calling/triggering MUST include an (edge:...->...) citation of type CALLS.
 """
 
 
@@ -36,8 +96,10 @@ class EvidencePack:
     externals: List[str]
     edges: List[Dict[str, object]]
     nodes: List[Dict[str, object]]
-    # Optional new field (safe default so it won't break callers)
+    # Optional: resolved virtual call targets
     virtual_targets: List[Dict[str, object]] = field(default_factory=list)
+    # Optional: a code snippet for the target function (filled by caller if desired)
+    source_snippet: str | None = None
 
 
 def build_prompt(evidence: EvidencePack) -> str:
@@ -49,6 +111,7 @@ def build_prompt(evidence: EvidencePack) -> str:
         "nodes": evidence.nodes,
         "edges": evidence.edges,
         "virtual_targets": evidence.virtual_targets,
+        "source_snippet": evidence.source_snippet,
     }
     return "\n".join(
         [
@@ -108,6 +171,15 @@ def _find_virtual_calls_from_target(
 
 
 def deterministic_summary(evidence: EvidencePack) -> str:
+    """
+    Build a fully deterministic, report-style explanation.
+
+    Sections:
+      1) Integrated explanation (GUESS)      [heuristic fallback; overwritten by LLM if provided]
+      2) Proven call-graph facts             [pure graph evidence]
+      3) External interactions & side effects
+      4) Code excerpt                        [trimmed source snippet]
+    """
     target = evidence.target
     target_id = str(target.get("id") or "")
 
@@ -126,43 +198,34 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         if isinstance(nid, str):
             nodes_by_id[nid] = n
 
+    # Precompute external nodes (we’ll reuse in side-effects / externals section)
+    external_nodes: List[Dict[str, object]] = []
+    for eid in evidence.externals or []:
+        if not isinstance(eid, str):
+            continue
+        node = nodes_by_id.get(eid)
+        if node:
+            external_nodes.append(node)
+
     lines: List[str] = []
 
-    # 1) What the function is
+    # ---------- Header: what the function is ----------
     qual = target.get("qualname")
     path = target.get("path")
     lineno = target.get("lineno")
     sig = target.get("signature")
-    lines.append("1) What the function is")
-    lines.append(
-        f"The function is `{qual}` (node:{target_id}), located in `{path}` at line {lineno}."
-    )
+    lines.append(f"Function: `{qual}` ({path}:{lineno}) (node:{target_id})")
     if sig:
-        lines.append(f"Its signature is `{sig}`. (node:{target_id})")
+        lines.append(f"Signature: `{sig}`")
     lines.append("")
 
-    # 2) What triggers it (ONLY explicit CALLS edges into target)
-    lines.append("2) What triggers it")
+    # Upstream/downstream CALLS edges
     call_edges_in: List[str] = []
     for c in callers:
         if not isinstance(c, str):
             continue
         if edge_type.get((c, target_id)) == "CALLS":
             call_edges_in.append(c)
-
-    if call_edges_in:
-        formatted = ", ".join(f"`{c}` (edge:{c}->{target_id})" for c in sorted(call_edges_in))
-        lines.append(f"Explicit callers (CALLS edges into target): {formatted}.")
-    else:
-        # Important: do NOT infer framework callbacks here
-        lines.append(
-            "No explicit callers were found in the provided graph evidence "
-            "(no CALLS edges into this function within the queried neighborhood)."
-        )
-    lines.append("")
-
-    # 3) What it does (ONLY CALLS edges out of target; externals; virtual calls)
-    lines.append("3) What it does")
 
     call_edges_out: List[str] = []
     for c in callees:
@@ -171,20 +234,7 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         if edge_type.get((target_id, c)) == "CALLS":
             call_edges_out.append(c)
 
-    if call_edges_out:
-        formatted = ", ".join(f"`{c}` (edge:{target_id}->{c})" for c in sorted(call_edges_out))
-        lines.append(f"It makes the following direct calls (CALLS edges): {formatted}.")
-    else:
-        lines.append("No direct downstream CALLS edges were found from this function in the evidence.")
-
-    # Externals (already computed by neighborhood)
-    if evidence.externals:
-        formatted = ", ".join(f"`{x}` (node:{x})" for x in evidence.externals)
-        lines.append(f"External dependencies present in the neighborhood: {formatted}.")
-
-    # -------------------------
     # Virtual / dynamic dispatch
-    # -------------------------
     vc_edges = _find_virtual_calls_from_target(target_id, evidence.edges)
     vc_ids_from_target = [dst for (_, dst) in vc_edges]
 
@@ -200,107 +250,239 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         if targets:
             vc_with_internal[vc_id] = {**vt, "targets": targets}
 
-    # 3a) VC sites that have INTERNAL candidate targets:
-    # explain the *relationship* (dynamic dispatch) but do NOT talk about VC nodes themselves.
+    # VC sites that have INTERNAL candidate targets
+    vc_resolved_targets: List[str] = []
     if vc_with_internal:
-        all_targets = sorted(
+        vc_resolved_targets = sorted(
             {t for vt in vc_with_internal.values() for t in vt["targets"]}  # type: ignore[index]
         )
-        formatted = ", ".join(f"`{t}` (node:{t})" for t in all_targets[:20])
-        lines.append(
-            "This function has dynamic dispatch sites that may call the following internal implementations "
-            f"(derived from CALLS_VIRTUAL edges plus type/inheritance analysis): {formatted}."
-        )
 
-    # 3b) VC sites with NO internal candidates:
-    # treat them as unresolved ONLY if they ALSO do not have a CALLS edge to a matching External.
+    # VC sites with NO internal candidates (and not resolved to externals)
     unresolved_vc_ids: List[str] = []
-
     for vc_id in vc_ids_from_target:
-        # already resolved to internal
         if vc_id in vc_with_internal:
             continue
-
         node = nodes_by_id.get(vc_id) or {}
         full_text = node.get("full_text")
-
-        # If we know the call text, check whether there is a CALLS edge to the matching External.
         if isinstance(full_text, str) and full_text:
             external_id = f"ext:{full_text}"
             if edge_type.get((target_id, external_id)) == "CALLS":
-                # Consider this virtual call "resolved to an external"; no need to mention it as unresolved VC.
                 continue
-
-        # Otherwise this really is unresolved from the explainer's POV.
         unresolved_vc_ids.append(vc_id)
 
-    if unresolved_vc_ids:
+    # 4) Inheritance / overrides (used later in facts; OVERRIDES edges only)
+    ov_out, ov_in = _find_override_edges_for_target(target_id, evidence.edges)
+
+    # 5) Notable side effects (only if evidence-based)
+    side_effect_nodes = [
+        n for n in external_nodes if n.get("side_effect_category")
+    ]
+
+    # Heuristic high-level intent setup (fallback if no LLM)
+    qual_str = str(qual) if qual is not None else ""
+    snippet = evidence.source_snippet or ""
+
+    # Add semantic hints from neighbor node names (callers, callees, externals, overrides, side-effect externals)
+    def _node_label(nid: str) -> str:
+        n = nodes_by_id.get(nid) or {}
+        return str(n.get("qualname") or n.get("name") or n.get("id") or nid)
+
+    neighbor_labels: List[str] = []
+    neighbor_labels.extend(_node_label(c) for c in callers if isinstance(c, str))
+    neighbor_labels.extend(_node_label(c) for c in callees if isinstance(c, str))
+    neighbor_labels.extend(_node_label(e) for e in evidence.externals if isinstance(e, str))
+    neighbor_labels.extend(_node_label(dst) for (_, dst) in ov_out)
+    neighbor_labels.extend(_node_label(src) for (src, _) in ov_in)
+    for n in side_effect_nodes:
+        nid = n.get("id")
+        if isinstance(nid, str):
+            neighbor_labels.append(_node_label(nid))
+
+    context_text = " ".join([qual_str, snippet] + neighbor_labels)
+    lc_context = context_text.lower()
+
+    guess_bits: List[str] = []
+
+    # --- Trading / strategy-specific heuristics ---
+    is_strategy = "strategy" in lc_context
+    mentions_trade = "on_trade" in lc_context or "trade" in lc_context
+    mentions_bars = "on_bars" in lc_context or "on_bar" in lc_context or "bars" in lc_context
+    mentions_positions = any(tok in lc_context for tok in ["pos", "position", "holding_days", "get_pos"])
+    mentions_price = any(tok in lc_context for tok in ["price", "volume", "cash", "turnover"])
+    mentions_vnpy = "vnpy" in lc_context
+
+    if is_strategy and mentions_trade:
+        detail_bits = []
+        if "holding_days" in lc_context:
+            detail_bits.append("updates or clears per-symbol holding period state")
+        if "direction.short" in lc_context or "direction.short" in lc_context.replace(" ", ""):
+            detail_bits.append("reacts specifically to short/closing trades")
+
+        detail_text = ""
+        if detail_bits:
+            detail_text = " — " + ", ".join(detail_bits)
+
+        guess_bits.append(
+            "Trade-event callback in a strategy that adjusts internal position bookkeeping "
+            f"when trades arrive{detail_text}. (**GUESS**)"
+        )
+    elif is_strategy and mentions_bars:
+        extra = []
+        if "signal" in lc_context:
+            extra.append("sorting or filtering assets by signal score")
+        if "buy" in lc_context or "sell" in lc_context:
+            extra.append("building instruments to buy/sell")
+        if "cash" in lc_context or "turnover" in lc_context:
+            extra.append("allocating cash across symbols")
+
+        extra_txt = ""
+        if extra:
+            extra_txt = " It appears to be " + ", ".join(extra) + "."
+
+        guess_bits.append(
+            "Bar-driven rebalancing step in an equity strategy, deciding which symbols to hold, buy, or exit "
+            f"based on signals and positions.{extra_txt} (**GUESS**)"
+        )
+    elif is_strategy and (mentions_positions or mentions_price or mentions_vnpy):
+        guess_bits.append(
+            "Part of a trading strategy coordinating positions, prices, and cash during the strategy lifecycle. (**GUESS**)"
+        )
+
+    # --- Data / analytics style heuristics ---
+    if not guess_bits and any(tok in lc_context for tok in ["dataframe", "polars", "pandas", "numpy"]):
+        guess_bits.append(
+            "Performs data transformation or analysis over table-like data structures (e.g. DataFrames). (**GUESS**)"
+        )
+
+    # --- Networking / HTTP heuristics ---
+    if not guess_bits and any(tok in lc_context for tok in ["request", "http", "client", "session"]):
+        guess_bits.append(
+            "Coordinates network or HTTP requests to external services. (**GUESS**)"
+        )
+
+    # Generic fallback if nothing else matched
+    if not guess_bits:
+        guess_bits.append(
+            "Normal function; not enough context to infer a specific role. (**GUESS**)"
+        )
+
+    # ---------- Section 1: Integrated explanation (heuristic fallback) ----------
+    lines.append("1) Integrated explanation (GUESS)")
+    for g in guess_bits:
+        lines.append(f"- {g}")
+    lines.append("")
+
+    # ---------- Section 2: Proven call-graph facts ----------
+    lines.append("2) Proven call-graph facts")
+
+    if call_edges_in:
+        formatted_callers = ", ".join(
+            f"`{_node_label(c)}` (edge:{c}->{target_id})" for c in sorted(call_edges_in)
+        )
+        lines.append(f"- **Callers**: {formatted_callers}")
+    else:
+        lines.append("- **Callers**: none in graph.")
+
+    if call_edges_out:
+        formatted_callees = ", ".join(
+            f"`{_node_label(c)}` (edge:{target_id}->{c})" for c in sorted(call_edges_out)
+        )
+        lines.append(f"- **Callees**: {formatted_callees}")
+    else:
+        lines.append("- **Callees**: none in graph.")
+
+    # Virtual dispatch facts
+    if vc_resolved_targets:
+        formatted_vc = ", ".join(f"`{t}` (node:{t})" for t in vc_resolved_targets[:20])
+        lines.append(
+            f"- **Virtual dispatch**: may target {formatted_vc} based on CALLS_VIRTUAL resolution."
+        )
+    elif unresolved_vc_ids:
         descs: List[str] = []
         for vc_id in unresolved_vc_ids[:10]:
             n = nodes_by_id.get(vc_id) or {}
             callee_attr = n.get("callee_attr")
             full_text = n.get("full_text")
             if isinstance(full_text, str) and full_text:
-                descs.append(
-                    f"`{vc_id}` calling `{full_text}` (edge:{target_id}->{vc_id})"
-                )
+                descs.append(f"`{vc_id}` -> `{full_text}` (edge:{target_id}->{vc_id})")
             elif isinstance(callee_attr, str) and callee_attr:
-                descs.append(
-                    f"`{vc_id}` calling attribute `{callee_attr}` (edge:{target_id}->{vc_id})"
-                )
+                descs.append(f"`{vc_id}` attribute `{callee_attr}` (edge:{target_id}->{vc_id})")
             else:
                 descs.append(f"`{vc_id}` (edge:{target_id}->{vc_id})")
+        lines.append(f"- **Virtual dispatch**: unresolved sites {', '.join(descs)}")
+    else:
+        lines.append("- **Virtual dispatch**: none noted.")
 
-        lines.append(
-            "There are dynamic callsites that the graph could not resolve to specific internal implementations "
-            "or to known external functions; they remain as unresolved virtual calls in the graph: "
-            + ", ".join(descs)
-            + "."
-        )
-
-    lines.append("")
-
-    # 4) Inheritance / overrides (OVERRIDES edges only; DO NOT imply calls)
-    lines.append("4) Inheritance / overrides")
-    ov_out, ov_in = _find_override_edges_for_target(target_id, evidence.edges)
+    # Overrides / inheritance
     if ov_out:
-        formatted = ", ".join(f"`{dst}` (edge:{src}->{dst})" for src, dst in ov_out)
-        lines.append(f"This method overrides: {formatted}.")
+        formatted_ov = ", ".join(f"`{_node_label(dst)}` (edge:{src}->{dst})" for src, dst in ov_out)
+        lines.append(f"- **Overrides**: overrides {formatted_ov}")
     elif ov_in:
-        formatted = ", ".join(f"`{src}` (edge:{src}->{dst})" for src, dst in ov_in)
-        lines.append(f"This method is overridden by: {formatted}.")
+        formatted_ov = ", ".join(f"`{_node_label(src)}` (edge:{src}->{dst})" for src, dst in ov_in)
+        lines.append(f"- **Overrides**: overridden by {formatted_ov}")
     else:
-        lines.append("No OVERRIDES edges involving this function were found in the evidence.")
+        lines.append("- **Overrides**: none.")
     lines.append("")
 
-    # 5) Notable side effects (only if evidence-based)
-    lines.append("5) Notable side effects")
-    # We cannot prove side effects from calls alone; keep conservative.
-    # But we can at least mention obvious mutators if present as externals (e.g., .pop/.append) without asserting impact.
-    mutators = [
-        x
-        for x in evidence.externals
-        if isinstance(x, str) and re.search(r"\.(pop|append|remove|clear|update|setdefault)$", x)
-    ]
-    if mutators:
-        formatted = ", ".join(f"`{m}` (node:{m})" for m in mutators[:20])
-        lines.append(
-            "The evidence shows calls to common mutator methods (which may imply state changes), "
-            f"but the exact state impact is not provable from the graph alone: {formatted}."
-        )
-    else:
-        lines.append("No side effects are provable from the provided graph evidence.")
-    lines.append("")
+    # ---------- Section 3: External interactions & side effects ----------
+    lines.append("3) External interactions & side effects")
 
-    # Optional: paths (useful for debugging, but keep short)
+    if external_nodes:
+        by_cat: Dict[str, List[Dict[str, object]]] = {}
+        for n in external_nodes:
+            cat = n.get("category") or "unclassified"
+            by_cat.setdefault(str(cat), []).append(n)
+
+        if by_cat:
+            parts: List[str] = []
+            for cat, group in sorted(by_cat.items(), key=lambda kv: kv[0]):
+                items: List[str] = []
+                for n in group[:10]:
+                    nid = n.get("id")
+                    nm = n.get("name") or nid
+                    ns = n.get("namespace")
+                    if ns:
+                        items.append(f"`{nm}` [ns={ns}] (node:{nid})")
+                    else:
+                        items.append(f"`{nm}` (node:{nid})")
+                joined = ", ".join(items) if items else "none"
+                parts.append(f"{cat}: {joined}")
+            lines.append(f"- **Externals**: {'; '.join(parts)}")
+    else:
+        lines.append("- **Externals**: none in neighborhood.")
+
+    if side_effect_nodes:
+        side_effect_items: List[str] = []
+        for n in side_effect_nodes[:20]:
+            nid = n.get("id")
+            nm = n.get("name") or nid
+            cat = n.get("side_effect_category")
+            conf = n.get("side_effect_confidence")
+            side_effect_items.append(
+                f"`{nm}` (node:{nid}, side_effect_category={cat}, confidence={conf})"
+            )
+        lines.append(f"- **Side effects (modelled)**: {', '.join(side_effect_items)}")
+    else:
+        mutators = [
+            x
+            for x in evidence.externals
+            if isinstance(x, str) and re.search(r"\.(pop|append|remove|clear|update|setdefault)$", x)
+        ]
+        if mutators:
+            mutator_text = ", ".join(f"`{m}` (node:{m})" for m in mutators[:20])
+            lines.append(
+                "- **Side effects (heuristic)**: uses common mutators (may imply state changes) "
+                f"{mutator_text}"
+            )
+        else:
+            lines.append("- **Side effects**: none provable from evidence.")
+
+    # Paths (sample, short) as supporting evidence
+    path_lines: List[str] = []
     if upstream_paths:
-        lines.append("Evidence: example upstream paths")
-        for p in upstream_paths[:5]:
-            lines.append(f"- `{p}`")
-        lines.append("")
-
+        for p in upstream_paths[:3]:
+            path_lines.append(f"  - Upstream path: `{p}`")
     if downstream_paths:
-        # Hide paths that only go through VCs we consider "resolved"
         resolved_vc_ids = set(vc_ids_from_target) - set(unresolved_vc_ids)
 
         def _path_has_resolved_vc(path: str) -> bool:
@@ -309,81 +491,185 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         filtered_downstream = [
             p for p in downstream_paths if not _path_has_resolved_vc(p)
         ]
+        for p in filtered_downstream[:3]:
+            path_lines.append(f"  - Downstream path: `{p}`")
 
-        if filtered_downstream:
-            lines.append(
-                "Evidence: example downstream paths "
-                "(functions plus any unresolved dynamic calls)"
-            )
-            for p in filtered_downstream[:5]:
-                lines.append(f"- `{p}`")
-            lines.append("")
+    if path_lines:
+        lines.append("- **Paths (samples)**:")
+        lines.extend(path_lines)
+    lines.append("")
+
+    # ---------- Section 4: Code excerpt ----------
+    def _trim_snippet(snippet_text: str, target_name: str) -> str:
+        snippet_lines = snippet_text.splitlines()
+        target_short = target_name.split(".")[-1]
+        start_idx = 0
+        for i, line in enumerate(snippet_lines):
+            if re.match(rf"\s*def\s+{re.escape(target_short)}\b", line):
+                start_idx = max(i - 1, 0)  # include potential decorator
+                break
+        trimmed = snippet_lines[start_idx:]
+        end_idx = len(trimmed)
+        for j, line in enumerate(trimmed[1:], start=1):
+            if re.match(r"\s*(def |class )", line):
+                end_idx = j
+                break
+        return "\n".join(trimmed[:end_idx]).strip()
+
+    if isinstance(evidence.source_snippet, str) and evidence.source_snippet.strip():
+        trimmed = _trim_snippet(evidence.source_snippet, qual_str or "")
+        lines.append("4) Code excerpt")
+        lines.append("```python")
+        lines.append(trimmed or evidence.source_snippet.rstrip())
+        lines.append("```")
 
     return "\n".join(lines).strip()
 
 
-def _llm_output_is_evidence_safe(llm_text: str, evidence: EvidencePack) -> bool:
+# ---------------------------------------------------------------------------
+# LLM helper: build Section 1 (Integrated explanation) from deterministic info
+# ---------------------------------------------------------------------------
+
+
+def _build_intent_from_deterministic(base: str, llm: Callable[[str], str]) -> str | None:
     """
-    A strict gate:
-    - If the model uses the word 'calls' or 'triggered by' without citing an edge:...->...,
-      reject.
-    - If it treats OVERRIDES as a call, reject.
+    Use the deterministic report (sections 2–4) as context and ask the LLM
+    to generate a *justified* Section 1 (Integrated explanation (GUESS)).
+
+    We ignore the existing body of section 1 in `base` and treat it as replaceable.
     """
-    t = llm_text.lower()
+    lines = base.splitlines()
 
-    # OVERRIDES misuse
-    if "overrides and then calls" in t:
-        return False
-    if "calls the base class" in t and "edge:" not in t:
-        return False
+    # Find section anchors
+    try:
+        s1_idx = lines.index("1) Integrated explanation (GUESS)")
+    except ValueError:
+        s1_idx = None
 
-    # Require edge citations for call/trigger language
-    risky_words = ["trigger", "triggered", "calls", "invoked by", "called by"]
-    if any(w in t for w in risky_words):
-        # Must have at least one edge citation if it uses these words
-        if "edge:" not in t:
-            return False
+    next_anchor = None
+    for i, line in enumerate(lines):
+        if line.strip() == "2) Proven call-graph facts":
+            next_anchor = i
+            break
 
-    # If it contains an edge citation, ensure it is a real CALLS edge (not OVERRIDES)
-    edge_type = _edge_type_lookup(evidence.edges)
-    cited_edges = re.findall(r"edge:([^\s\)]+)->([^\s\)]+)", llm_text)
-    for src, dst in cited_edges:
-        typ = edge_type.get((src, dst))
-        if typ is None:
-            # unknown edge cited
-            return False
-        # If they describe calling with an OVERRIDES edge, reject.
-        if typ == "OVERRIDES" and ("call" in t or "trigger" in t):
-            return False
+    # Build context *without* the old section-1 body.
+    if next_anchor is None or s1_idx is None or s1_idx > next_anchor:
+        # Unexpected shape; fall back to giving the whole thing.
+        context_text = base
+    else:
+        # Keep the heading line for context, plus everything from section 2 onwards.
+        context_text = "\n".join(
+            lines[: s1_idx + 1] +  # up to and including "1) Integrated explanation (GUESS)"
+            lines[next_anchor:]    # start at "2) Proven call-graph facts"
+        )
 
-    return True
+    prompt = "\n".join(
+        [
+            "You are AlgoTracer-Intent.",
+            "",
+            "You are given a structured, deterministic report about a Python function.",
+            "It includes:",
+            "- A heading with the function's location and signature.",
+            "- Section 2: Proven call-graph facts (callers, callees, virtual dispatch, overrides).",
+            "- Section 3: External interactions & side effects.",
+            "- Section 4: A trimmed code excerpt.",
+            "",
+            "Your task:",
+            "- Rewrite **Section 1) Integrated explanation (GUESS)** as a short report-style",
+            "  explanation that ties these facts together.",
+            "- Explicitly ground your explanation in the facts: when you mention who calls",
+            "  this function, what it calls, externals it uses, or side effects, they MUST",
+            "  correspond to entries present in Sections 2 or 3.",
+            "- Do NOT invent new function/class/module names or new call relationships.",
+            "- Do NOT introduce new edge:src->dst citations.",
+            "- Do NOT contradict any stated facts; this section is an intuitive narrative",
+            "  built strictly on the given facts.",
+            "- End your final sentence with (**GUESS**).",
+            "",
+            "Style:",
+            "- Either a short paragraph or 3–6 bullets is fine.",
+            "- Make it read like a mini report: start from what the function is,",
+            "  then how it is used (callers), what it does internally (callees / externals),",
+            "  and what role it plays overall.",
+            "",
+            "Format:",
+            "- Output ONLY the body of Section 1, WITHOUT the heading line",
+            "  '1) Integrated explanation (GUESS)'.",
+            "",
+            "Here is the deterministic report (ignore any existing text under Section 1):",
+            "<BEGIN_REPORT>",
+            context_text,
+            "<END_REPORT>",
+        ]
+    )
+
+    try:
+        text = llm(prompt).strip()
+    except Exception as exc:
+        print(f"[AlgoTracer][LLM] intent exception: {exc!r}")
+        return None
+
+    if not text:
+        print("[AlgoTracer][LLM] intent returned empty output")
+        return None
+
+    # Light safety: don't allow raw edge: citations in the GUESS text.
+    if "edge:" in text:
+        print("[AlgoTracer][LLM] intent contains raw edge citations – rejecting.")
+        return None
+
+    return text
 
 
 def explain(evidence: EvidencePack, llm: Optional[Callable[[str], str]] = None) -> str:
     """
-    Deterministic-first:
-    - Always return a correct evidence summary.
-    - If LLM is provided, use it only if the output passes a strict evidence safety gate.
-      Otherwise return deterministic output.
+    Final behavior:
+
+    1. Build a deterministic report from graph evidence (sections 1–4).
+    2. If no LLM is provided, return that directly.
+    3. If LLM is provided, use it ONLY to regenerate Section 1
+       (Integrated explanation (GUESS)), based on the deterministic report.
+    4. If anything looks off, fall back to the deterministic report.
     """
     base = deterministic_summary(evidence)
 
     if llm is None:
         return base
 
-    prompt = build_prompt(evidence)
+    print("AlgoTracer: LLM enabled (integrated intent mode).")
+    print("[AlgoTracer][LLM] building Section 1 (Integrated explanation)...")
+
+    intent = _build_intent_from_deterministic(base, llm)
+    if intent is None:
+        print("[AlgoTracer][LLM] intent rejected or failed – using deterministic report")
+        return base
+
+    print("[AlgoTracer][LLM] intent accepted, stitching into output.")
+
+    lines = base.splitlines()
     try:
-        llm_text = llm(prompt).strip()
-    except Exception:
-        return base
+        s1_idx = lines.index("1) Integrated explanation (GUESS)")
+    except ValueError:
+        # No section-1 header found; just append a new section at the end.
+        return base + "\n\n1) Integrated explanation (GUESS)\n" + intent
 
-    if not llm_text:
-        return base
+    # Find where section 1 ends (start of section 2 or end of doc).
+    end_idx = len(lines)
+    for i in range(s1_idx + 1, len(lines)):
+        if lines[i].startswith("2) "):
+            end_idx = i
+            break
 
-    if not _llm_output_is_evidence_safe(llm_text, evidence):
-        return base
+    before = lines[: s1_idx + 1]   # keep the heading itself
+    after = lines[end_idx:]        # everything from section 2 onwards
 
-    return llm_text
+    new_lines: List[str] = []
+    new_lines.extend(before)
+    new_lines.extend(intent.splitlines())
+    new_lines.append("")           # blank line after section-1 body
+    new_lines.extend(after)
+
+    return "\n".join(new_lines).strip()
 
 
 def build_gemini_llm(api_key: str | None = None, model: str = "gemini-2.5-flash") -> Callable[[str], str]:
@@ -404,3 +690,100 @@ def build_gemini_llm(api_key: str | None = None, model: str = "gemini-2.5-flash"
         return text.strip() if isinstance(text, str) else str(resp)
 
     return _call
+
+
+# ---------- glue: Neighborhood -> EvidencePack with code snippet ----------
+
+
+def _extract_source_snippet_from_nodes(
+    target: Dict[str, object],
+    nodes: List[Dict[str, object]],
+    *,
+    repo_root: Path | None = None,
+    context_lines: int = 15,
+) -> str | None:
+    """
+    Best-effort: find the file and grab a window of source around the target's lineno.
+    Priority:
+    1) Use Module.abs_path if present in the neighborhood.
+    2) Fallback to repo_root / Function.path if repo_root is provided.
+    """
+    func_path = target.get("path")
+    lineno = target.get("lineno")
+    if not func_path or not isinstance(lineno, int):
+        return None
+
+    abs_path: str | None = None
+
+    # Try to find a Module node with matching path and an abs_path
+    for n in nodes:
+        if "Module" in (n.get("labels") or []):
+            if n.get("path") == func_path and n.get("abs_path"):
+                abs_path = str(n["abs_path"])
+                break
+
+    # Fallback: repo_root + relative path
+    if not abs_path and repo_root is not None:
+        abs_path = str((repo_root / str(func_path)).resolve())
+
+    if not abs_path:
+        return None
+
+    try:
+        lines = Path(abs_path).read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return None
+
+    start = max(0, lineno - 1 - context_lines)
+    end = min(len(lines), lineno - 1 + context_lines)
+    return "\n".join(lines[start:end])
+
+
+def evidence_from_neighborhood(
+    neighborhood: Neighborhood,
+    *,
+    repo_root: Path | None = None,
+) -> EvidencePack:
+    """
+    Turn a Neighborhood into an EvidencePack the explainer understands,
+    automatically attaching a source snippet.
+    """
+    target = neighborhood.target
+    nodes = neighborhood.nodes
+    edges = neighborhood.edges
+
+    upstream = {
+        "callers": neighborhood.callers,
+        "paths": neighborhood.upstream_paths,
+    }
+    downstream = {
+        "callees": neighborhood.callees,
+        "paths": neighborhood.downstream_paths,
+    }
+
+    source_snippet = _extract_source_snippet_from_nodes(
+        target,
+        nodes,
+        repo_root=repo_root,
+    )
+
+    # 🔍 DEBUG: check whether the snippet is empty
+    preview = (source_snippet or "").strip()
+    print(
+        "[AlgoTracer] source_snippet empty? "
+        f"{not bool(preview)} "
+        f"for {target.get('qualname')} at {target.get('path')}:{target.get('lineno')}"
+    )
+    if preview:
+        print("[AlgoTracer] source_snippet preview:\n", preview[:200])
+
+    return EvidencePack(
+        target=target,
+        upstream=upstream,
+        downstream=downstream,
+        externals=neighborhood.externals,
+        edges=edges,
+        nodes=nodes,
+        virtual_targets=neighborhood.virtual_targets,
+        source_snippet=source_snippet,
+    )
