@@ -4,6 +4,8 @@ AlgoTracer builds a Python call graph inside Memgraph and explains what a functi
 
 Unlike static analyzers that over-resolve everything, AlgoTracer treats uncertain instance/class calls as virtual calls and resolves them safely when needed.
 
+The explainer now emits a concise, report-style Markdown summary that blends graph evidence with light heuristics (and optionally an LLM) to describe intent.
+
 ## 🧠 Problem & Motivation
 
 Python codebases are full of calls like:
@@ -41,6 +43,8 @@ Your repo becomes a compact, queryable graph.
 | Function    | Function or method             |
 | External    | Unresolved / outside-repo call |
 | VirtualCall | Deferred instance/class call   |
+
+External nodes carry `name`, `namespace`, and a `category` classified as `stdlib`, `third_party`, or `unresolved`. If a call matches side-effect heuristics, the External also stores `side_effect_category`/`side_effect_confidence`/`side_effect_evidence`.
 
 **Edge Types**
 
@@ -116,20 +120,27 @@ algotracer explain path/to/repo \
 - Otherwise deterministic summary
 - Always grounded in graph truth
 
-## 🧠 How Virtual Calls Work
+## 🧾 Explanation Output
 
-| Stage   | What happens                                  |
-|---------|-----------------------------------------------|
-| ingest  | detect `self.foo()` / `cls.bar()` / etc       |
-| graph   | store `CALLS_VIRTUAL` → `VirtualCall`         |
-| explain | resolve possible receivers using class graph  |
-| output  | produce bounded “may call” targets            |
+For each target function, the explainer produces a Markdown report:
 
-Included heuristics:
-- `self.method()`
-- `cls.method()`
-- `super().method()`
-- Named receiver fallback where possible
+- **Header**: `Function: <qualname> (<path>:<lineno>) (node:<id>)`, `Signature: ...`
+- **Summary**: 1–2 bullets of high-level intent (**GUESS**) derived from:
+  - Target qualname and source snippet (trimmed to the function body)
+  - Neighbor semantics: caller/callee names, override relations, externals, side-effect externals
+  - Domain cues (trading, data/analytics, networking)
+- **Evidence** (all edge-backed):
+  - Upstream CALLS edges into the function (with citations)
+  - Downstream CALLS edges out of the function (with citations)
+  - Externals grouped by category (`stdlib`/`third_party`/`unresolved`, with node ids/namespaces)
+  - Overrides (OVERRIDES edges only)
+  - Side effects (explicit `side_effect_*` metadata or mutator externals)
+  - Virtual dispatch: resolved targets (CALLS_VIRTUAL + type analysis) or unresolved virtual callsites
+  - Paths (sampled upstream/downstream paths, short)
+- **Code**: trimmed source snippet of the target function (decorators included when present)
+
+LLM usage:
+- If `--no-llm` is absent and Gemini is available, `explain` will call the LLM and return its response only if it passes a strict evidence-safety gate (edge citations required for call claims). Otherwise, it falls back to the deterministic report above.
 
 ## 🗺️ Graph Navigation Cheatsheet
 
@@ -187,15 +198,18 @@ algotracer explain <path>
   4) Returns `virtual_targets` (virtual call id + possible function ids), bounded and repo-scoped to avoid blowups.
 - Deterministic `CALLS` edges are used as-is; virtuals are expanded on demand for explanation.
 
-## How to read the graph (at a glance)
-- Modules: `Repo-[:HAS_MODULE]->Module (stable:mod:<path>)`.
-- Classes: `Module-[:DEFINES_CLASS]->Class`, `Class-[:SUBCLASS_OF]->Class`, `Class-[:DEFINES]->Function` (methods).
-- Functions: `Function {id=stable:sym:<path>:<qualname>, owner_class?, kind, lineno, signature}`; `Module-[:DEFINES]->Function`, `Class-[:DEFINES]->Function` for methods.
-- Overrides: `Function-[:OVERRIDES]->Function` (child -> parent method; best-effort).
-- Calls (deterministic): `Function-[:CALLS]->Function|External` when resolvable; side-effects also use External nodes.
-- Virtual calls: `Function-[:CALLS_VIRTUAL]->VirtualCall` when we deliberately defer resolution.
+## External call classification & side-effect signals
+
+- **External categories**: every External is labeled as `stdlib`, `third_party`, or `unresolved` via `_classify_external` (import-aware).
+- **Side-effect heuristics**: common patterns are tagged with `side_effect_category` + `side_effect_confidence` (kept if unset):
+  - `io.file`, `io.file_read`, `io.file_write`
+  - `io.console`
+  - `io.network`
+  - `system.process`
+  - `external.service`
+  - `db.query`
+- The explainer surfaces these under “Side effects” and includes External names/namespaces in “Externals.”
 
 ## Connection settings
 - Env vars: `MEMGRAPH_HOST` (default `127.0.0.1`), `MEMGRAPH_PORT` (default `7687`), `MEMGRAPH_USER`, `MEMGRAPH_PASSWORD` (optional)
 - CLI flags override env: `--memgraph-host/--memgraph-port/--memgraph-user/--memgraph-password`.
-

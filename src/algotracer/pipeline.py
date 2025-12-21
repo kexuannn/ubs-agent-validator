@@ -17,7 +17,7 @@ from algotracer.graph.resolver import (
 )
 from algotracer.ingest.ast_parser import parse_python_files
 from algotracer.memgraph.client import MemgraphConfig, clear_repo, connect_memgraph, ensure_schema
-from algotracer.reasoning.explainer import EvidencePack, build_gemini_llm, explain
+from algotracer.reasoning.explainer import build_gemini_llm, evidence_from_neighborhood, explain
 
 
 @dataclass(frozen=True)
@@ -99,21 +99,9 @@ class AlgoTracerPipeline:
             ),
         )
 
-        evidence = EvidencePack(
-            target=neighborhood.target,
-            upstream={
-                "depth": config.depth_up,
-                "callers": neighborhood.callers,
-                "paths": neighborhood.upstream_paths,
-            },
-            downstream={
-                "depth": config.depth_down,
-                "callees": neighborhood.callees,
-                "paths": neighborhood.downstream_paths,
-            },
-            externals=neighborhood.externals,
-            edges=neighborhood.edges,
-            nodes=neighborhood.nodes,
+        evidence = evidence_from_neighborhood(
+            neighborhood,
+            repo_root=config.repo_path,
         )
 
         if config.debug_subgraph_path is not None:

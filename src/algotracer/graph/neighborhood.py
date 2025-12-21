@@ -39,6 +39,7 @@ def _node_to_dict(n: object) -> Dict[str, object]:
         "name": props.get("name"),
         "qualname": props.get("qualname"),
         "path": props.get("path"),
+        "abs_path": props.get("abs_path"),  # used for source-snippet extraction
         "lineno": props.get("lineno"),
         "kind": props.get("kind"),
         "signature": props.get("signature"),
@@ -48,13 +49,21 @@ def _node_to_dict(n: object) -> Dict[str, object]:
         "owner_class_id": props.get("owner_class_id"),
     }
 
-    # surface VirtualCall metadata so explainer can see it
+    # Surface VirtualCall metadata so explainer can see it
     if "VirtualCall" in (out["labels"] or []):
         out["callee_attr"] = props.get("callee_attr")
         out["receiver_kind"] = props.get("receiver_kind")
         out["receiver_name"] = props.get("receiver_name")
         out["full_text"] = props.get("full_text")
         out["call_kind"] = props.get("call_kind")
+
+    # Surface External metadata so explainer can classify stdlib / third_party / unresolved
+    if "External" in (out["labels"] or []):
+        out["category"] = props.get("category")
+        out["namespace"] = props.get("namespace")
+        out["side_effect_category"] = props.get("side_effect_category")
+        out["side_effect_confidence"] = props.get("side_effect_confidence")
+        out["side_effect_evidence"] = props.get("side_effect_evidence")
 
     return out
 

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import hashlib
 from pathlib import Path
 from typing import Dict, Iterable, List, Sequence, Tuple
+import sys
 
 from gqlalchemy import Memgraph
 
@@ -353,6 +354,7 @@ def _resolve_in_module(
     if current_class:
         parts = call.split(".")
 
+        # Handle super().foo(...) → resolve in base classes
         if parts and parts[0] == "super()" and len(parts) >= 2:
             method_name = parts[-1]
             return _resolve_in_bases(
@@ -364,24 +366,42 @@ def _resolve_in_module(
                 import_maps=import_maps,
             )
 
-        if parts and parts[0] in {"self", "cls"} and len(parts) >= 2:
-            method_name = parts[-1]
-            if method_name in module_record.class_methods.get(current_class, set()):
-                return ResolvedTarget(kind="function", module=module_record.name, qualname=f"{current_class}.{method_name}", external_name=None)
+        # Handle direct self/cls method calls ONLY for `self.foo` / `cls.foo`
+        # Do NOT treat `self.x.foo` as a method on the current class to avoid
+        # bogus self-loops like LassoModel.predict -> LassoModel.predict.
+        if parts and parts[0] in {"self", "cls"}:
+            # `self.foo` / `cls.foo` → len == 2 → method_name = parts[1]
+            if len(parts) == 2:
+                method_name = parts[1]
+                if method_name in module_record.class_methods.get(current_class, set()):
+                    return ResolvedTarget(
+                        kind="function",
+                        module=module_record.name,
+                        qualname=f"{current_class}.{method_name}",
+                        external_name=None,
+                    )
 
-            candidate = _resolve_in_bases(
-                method_name,
-                current_class,
-                module_record=module_record,
-                module_index=module_index,
-                import_map=import_map,
-                import_maps=import_maps,
-            )
-            if candidate is not None:
-                return candidate
+                candidate = _resolve_in_bases(
+                    method_name,
+                    current_class,
+                    module_record=module_record,
+                    module_index=module_index,
+                    import_map=import_map,
+                    import_maps=import_maps,
+                )
+                if candidate is not None:
+                    return candidate
+            # For deeper chains like `self.model.predict`, skip resolving to the
+            # current class; these will fall through and be treated as external.
 
+        # Unqualified method calls inside a class: `foo(...)`
         if len(parts) == 1 and call in module_record.class_methods.get(current_class, set()):
-            return ResolvedTarget(kind="function", module=module_record.name, qualname=f"{current_class}.{call}", external_name=None)
+            return ResolvedTarget(
+                kind="function",
+                module=module_record.name,
+                qualname=f"{current_class}.{call}",
+                external_name=None,
+            )
 
         if len(parts) == 1:
             candidate = _resolve_in_bases(
@@ -399,10 +419,20 @@ def _resolve_in_module(
     if len(parts) >= 2:
         class_name, method_name = parts[-2], parts[-1]
         if class_name in module_record.class_methods and method_name in module_record.class_methods.get(class_name, set()):
-            return ResolvedTarget(kind="function", module=module_record.name, qualname=f"{class_name}.{method_name}", external_name=None)
+            return ResolvedTarget(
+                kind="function",
+                module=module_record.name,
+                qualname=f"{class_name}.{method_name}",
+                external_name=None,
+            )
 
     if call in module_record.functions:
-        return ResolvedTarget(kind="function", module=module_record.name, qualname=call, external_name=None)
+        return ResolvedTarget(
+            kind="function",
+            module=module_record.name,
+            qualname=call,
+            external_name=None,
+        )
 
     return None
 
@@ -443,6 +473,24 @@ def _virtual_call_id(src_func_id: str, callee_attr: str | None, receiver: str | 
     suffix = "|".join([callee_attr or "unknown", receiver or "unknown", str(lineno or 0)])
     h = hashlib.sha1(f"{src_func_id}:{suffix}".encode("utf-8")).hexdigest()[:12]
     return f"vc:{h}"
+
+
+_STDLIB_MODULES = set(getattr(sys, "stdlib_module_names", ())) or set(sys.builtin_module_names)
+
+
+def _classify_external(
+    external_name: str,
+    *,
+    module_record: ModuleRecord,
+    import_map: Dict[str, ImportTarget],
+) -> str:
+    """Heuristic external classification."""
+    root = (external_name or "").split(".", 1)[0]
+    if root in _STDLIB_MODULES:
+        return "stdlib"
+    if root in import_map:
+        return "third_party"
+    return "unresolved"
 
 
 def _emit_overrides_edges(
@@ -643,9 +691,18 @@ def write_graph(*, mg: Memgraph, modules: Sequence[ModuleInfo], config: GraphBui
                 else:
                     external_name = resolved.external_name or call
                     external_id = f"ext:{external_name}"
+                    import_map_local = import_maps.get(module_record.name, {})
+                    category = _classify_external(external_name, module_record=module_record, import_map=import_map_local)
                     mg.execute(
-                        "MERGE (e:External {repo_id: $repo_id, id: $id}) SET e.name = $name, e.namespace = $namespace",
-                        {"repo_id": config.repo_id, "id": external_id, "name": external_name, "namespace": _namespace_for_external(external_name)},
+                        "MERGE (e:External {repo_id: $repo_id, id: $id}) "
+                        "SET e.name = $name, e.namespace = $namespace, e.category = $category",
+                        {
+                            "repo_id": config.repo_id,
+                            "id": external_id,
+                            "name": external_name,
+                            "namespace": _namespace_for_external(external_name),
+                            "category": category,
+                        },
                     )
                     mg.execute(
                         "MATCH (src:Function {repo_id: $repo_id, id: $src_id}), (dst:External {repo_id: $repo_id, id: $dst_id}) "
@@ -716,9 +773,13 @@ def write_graph(*, mg: Memgraph, modules: Sequence[ModuleInfo], config: GraphBui
 
             for effect in infer_side_effects(func.calls):
                 external_id = f"ext:{effect.call}"
+                module_name = module_names_by_path[stable_path]
+                module_record = module_index[module_name]
+                import_map_local = import_maps.get(module_name, {})
+                ext_category = _classify_external(effect.call, module_record=module_record, import_map=import_map_local)
                 mg.execute(
                     "MERGE (e:External {repo_id: $repo_id, id: $id}) "
-                    "SET e.name = $name, e.namespace = $namespace "
+                    "SET e.name = $name, e.namespace = $namespace, e.category = $ext_category "
                     "WITH e "
                     "SET "
                     "e.side_effect_category = CASE WHEN e.side_effect_category IS NULL THEN $category ELSE e.side_effect_category END, "
@@ -729,6 +790,7 @@ def write_graph(*, mg: Memgraph, modules: Sequence[ModuleInfo], config: GraphBui
                         "id": external_id,
                         "name": effect.call,
                         "namespace": _namespace_for_external(effect.call),
+                        "ext_category": ext_category,
                         "category": effect.category,
                         "confidence": effect.confidence,
                         "evidence": effect.evidence,
