@@ -234,7 +234,7 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         if edge_type.get((target_id, c)) == "CALLS":
             call_edges_out.append(c)
 
-    # Virtual / dynamic dispatch
+    # Virtual / dynamic dispatch for THIS target
     vc_edges = _find_virtual_calls_from_target(target_id, evidence.edges)
     vc_ids_from_target = [dst for (_, dst) in vc_edges]
 
@@ -277,29 +277,35 @@ def deterministic_summary(evidence: EvidencePack) -> str:
                 continue
         unresolved_vc_ids.append(vc_id)
 
-    # Build a human-friendly label for each VC based on its node metadata.
-    # We prefer:
-    #   - full_text (e.g. "self.pos_data.items")
-    #   - or receiver_name.callee_attr
-    #   - or just callee_attr
+    # Helper to build a label from a VC node
+    def _build_vc_label(node: Dict[str, object]) -> Optional[str]:
+        full_text = node.get("full_text")
+        if isinstance(full_text, str) and full_text.strip():
+            return full_text.strip()
+        recv = node.get("receiver_name")
+        attr = node.get("callee_attr")
+        if isinstance(recv, str) and isinstance(attr, str):
+            return f"{recv}.{attr}"
+        if isinstance(attr, str):
+            return attr
+        return None
+
+    # Labels for VCs OWNED by this target (for section 2 + paths)
     vc_labels: Dict[str, str] = {}
     for vc_id in vc_ids_from_target:
         node = nodes_by_id.get(vc_id) or {}
-        label: Optional[str] = None
-
-        full_text = node.get("full_text")
-        if isinstance(full_text, str) and full_text.strip():
-            label = full_text.strip()
-        else:
-            recv = node.get("receiver_name")
-            attr = node.get("callee_attr")
-            if isinstance(recv, str) and isinstance(attr, str):
-                label = f"{recv}.{attr}"
-            elif isinstance(attr, str):
-                label = attr
-
+        label = _build_vc_label(node)
         if label:
             vc_labels[vc_id] = label
+
+    # Global labels for ALL VC nodes in the neighborhood (for path decoration)
+    vc_labels_all: Dict[str, str] = {}
+    for nid, node in nodes_by_id.items():
+        if not isinstance(nid, str) or not nid.startswith("vc:"):
+            continue
+        label = _build_vc_label(node)
+        if label:
+            vc_labels_all[nid] = label
 
     # 4) Inheritance / overrides (used later in facts; OVERRIDES edges only)
     ov_out, ov_in = _find_override_edges_for_target(target_id, evidence.edges)
@@ -422,7 +428,7 @@ def deterministic_summary(evidence: EvidencePack) -> str:
     else:
         lines.append("- **Callees**: none in graph.")
 
-    # Virtual dispatch facts
+    # Virtual dispatch facts (for THIS target)
     if vc_resolved_targets:
         formatted_vc = ", ".join(f"`{t}` (node:{t})" for t in vc_resolved_targets[:20])
         lines.append(
@@ -434,10 +440,11 @@ def deterministic_summary(evidence: EvidencePack) -> str:
             n = nodes_by_id.get(vc_id) or {}
             callee_attr = n.get("callee_attr")
             full_text = n.get("full_text")
-            if isinstance(full_text, str) and full_text:
-                descs.append(f"`{vc_id}` -> `{full_text}` (edge:{target_id}->{vc_id})")
-            elif isinstance(callee_attr, str) and callee_attr:
-                descs.append(f"`{vc_id}` attribute `{callee_attr}` (edge:{target_id}->{vc_id})")
+            label = vc_labels.get(vc_id)
+            label_text = label or full_text or callee_attr
+
+            if isinstance(label_text, str) and label_text:
+                descs.append(f"`{vc_id}` -> `{label_text}` (edge:{target_id}->{vc_id})")
             else:
                 descs.append(f"`{vc_id}` (edge:{target_id}->{vc_id})")
         lines.append(f"- **Virtual dispatch**: unresolved sites {', '.join(descs)}")
@@ -511,15 +518,16 @@ def deterministic_summary(evidence: EvidencePack) -> str:
     # ---------- Paths (with VirtualCall annotations) ----------
     #
     # We KEEP vc:<id> in the path strings, but:
-    # - If a VC has resolved targets, we rewrite it as:
-    #       vc:<id>[callsite]→[TargetFunc1, TargetFunc2, …]
-    # - If it has no internal targets, we mark it as:
-    #       vc:<id>[callsite][unresolved]
+    # - If a VC has resolved targets for THIS function, we rewrite it as:
+    #       vc:<id>[label]→[TargetFunc1, TargetFunc2, …]
+    # - If it has no internal targets (for THIS function), we mark it as:
+    #       vc:<id>[label][unresolved]
+    # - For ANY vc:<id> that appears in a path, we at least attach [label].
 
     def _annotate_path(p: str) -> str:
         out_p = p
 
-        # First, annotate resolved VCs with their INTERNAL targets
+        # First, annotate resolved VCs with their INTERNAL targets (for this target)
         for vc_id, vt in vc_with_internal.items():
             if vc_id not in out_p:
                 continue
@@ -537,12 +545,11 @@ def deterministic_summary(evidence: EvidencePack) -> str:
                 shown += ", …"
 
             vc_label = vc_labels.get(vc_id)
-            # Example: vc:a3a4db0bf2b3[self.pos_data.items]→[EquityDemoStrategy.on_bars, …]
             call_part = f"[{vc_label}]" if vc_label else ""
             replacement = f"{vc_id}{call_part}→[{shown}]"
             out_p = out_p.replace(vc_id, replacement)
 
-        # Next, annotate VCs resolved to external targets
+        # Next, annotate VCs resolved to external targets (for this target)
         for vc_id, ext_ids in vc_with_external.items():
             if vc_id not in out_p:
                 continue
@@ -559,12 +566,23 @@ def deterministic_summary(evidence: EvidencePack) -> str:
             replacement = f"{vc_id}{call_part}→[{shown}]"
             out_p = out_p.replace(vc_id, replacement)
 
-        # Then, mark any remaining VCs as unresolved, but still show the callsite name if we know it.
+        # Then, mark any remaining VCs (for this target) as unresolved,
+        # but still show the callsite name if we know it.
         for vc_id in unresolved_vc_ids:
             if vc_id and vc_id in out_p:
                 vc_label = vc_labels.get(vc_id)
                 call_part = f"[{vc_label}]" if vc_label else ""
                 out_p = out_p.replace(vc_id, f"{vc_id}{call_part}[unresolved]")
+
+        # Finally, for ANY VC node in the neighborhood that appears in the path,
+        # attach its label if it's not already annotated.
+        for vc_id, label in vc_labels_all.items():
+            if vc_id not in out_p:
+                continue
+            # If we've already added a '[...]' immediately after vc_id, skip
+            if f"{vc_id}[" in out_p:
+                continue
+            out_p = out_p.replace(vc_id, f"{vc_id}[{label}]")
 
         return out_p
 
@@ -611,6 +629,7 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         lines.append("```")
 
     return "\n".join(lines).strip()
+
 
 
 # ---------------------------------------------------------------------------
