@@ -178,11 +178,13 @@ def fetch_neighborhood(*, mg: Memgraph, repo_id: str, func_id: str, config: Neig
     edges: List[Dict[str, object]] = []
     downstream_strings: List[str] = []
     upstream_strings: List[str] = []
+    downstream_path_nodes: List[Sequence[Dict[str, object]]] = []
     virtual_call_ids: Set[str] = set()
 
     for path in downstream_paths:
         nodes.extend(path["nodes"])
         edges.extend(path["rels"])
+        downstream_path_nodes.append(path["nodes"])
         downstream_strings.append(_path_to_string(path["nodes"]))
         for n in path["nodes"]:
             if "VirtualCall" in (n.get("labels") or []) and n.get("id"):
@@ -256,7 +258,15 @@ def fetch_neighborhood(*, mg: Memgraph, repo_id: str, func_id: str, config: Neig
     # Virtual call resolution
     # ------------------------
     virtual_targets: List[Dict[str, object]] = []
+    resolved_virtual_ids: Set[str] = set()
     if virtual_call_ids:
+        external_nodes = [n for n in nodes if "External" in (n.get("labels") or [])]
+        external_ids: Set[str] = {str(n.get("id")) for n in external_nodes if n.get("id")}
+        external_ids_by_name: Dict[str, Set[str]] = {}
+        for n in external_nodes:
+            nm = n.get("name")
+            if nm:
+                external_ids_by_name.setdefault(str(nm), set()).add(str(n.get("id")))
         # parent map by class_id
         class_edges = list(
             mg.execute_and_fetch(
@@ -329,6 +339,7 @@ def fetch_neighborhood(*, mg: Memgraph, repo_id: str, func_id: str, config: Neig
                     candidate_type_ids |= _closure_types(cr.get("id"))
 
             targets: Set[str] = set()
+            external_targets: Set[str] = set()
 
             if callee_attr:
                 # Primary: method on candidate types (GLOBAL query)
@@ -355,6 +366,20 @@ def fetch_neighborhood(*, mg: Memgraph, repo_id: str, func_id: str, config: Neig
                             targets.add(str(r["id"]))
 
             if targets:
+                resolved_virtual_ids.add(vc_id)
+            else:
+                full_text = vc_row.get("full_text")
+                if isinstance(full_text, str) and full_text:
+                    external_targets |= external_ids_by_name.get(full_text, set())
+                    ext_id = f"ext:{full_text}"
+                    if ext_id in external_ids:
+                        external_targets.add(ext_id)
+                if callee_attr:
+                    external_targets |= external_ids_by_name.get(callee_attr, set())
+                if external_targets:
+                    resolved_virtual_ids.add(vc_id)
+
+            if targets or external_targets:
                 virtual_targets.append(
                     {
                         "virtual_call_id": vc_id,
@@ -362,9 +387,32 @@ def fetch_neighborhood(*, mg: Memgraph, repo_id: str, func_id: str, config: Neig
                         "callee_attr": callee_attr,
                         "receiver_kind": receiver_kind,
                         "receiver_name": receiver_name,
+                        "external_targets": sorted(external_targets),
                     }
                 )
 
+    # Build downstream path strings with filters:
+    # - no External nodes
+    # - only include paths whose VirtualCall nodes (if any) were resolved (internal or external)
+    def _is_function_node(n: Dict[str, object]) -> bool:
+        return "Function" in (n.get("labels") or [])
+
+    downstream_strings = []
+    for nodes_seq in downstream_path_nodes:
+        if not nodes_seq:
+            continue
+        if any("External" in (n.get("labels") or []) for n in nodes_seq):
+            continue
+        vc_ids_in_path = [
+            str(n.get("id")) for n in nodes_seq if "VirtualCall" in (n.get("labels") or []) and n.get("id")
+        ]
+        if vc_ids_in_path and not all(vc_id in resolved_virtual_ids for vc_id in vc_ids_in_path):
+            continue
+        if not _is_function_node(nodes_seq[-1]) and vc_ids_in_path:
+            pass
+        elif not _is_function_node(nodes_seq[-1]):
+            continue
+        downstream_strings.append(_path_to_string(nodes_seq))
     return Neighborhood(
         target=target,
         nodes=nodes,
