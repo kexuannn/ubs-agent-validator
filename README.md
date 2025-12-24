@@ -1,215 +1,263 @@
-# AlgoTracer
 
-AlgoTracer builds a Python call graph inside Memgraph and explains what a function does using only graph facts — not guesses, not static summaries.
+# AlgoTracer — Static Python Call Graph & Virtual Dispatch Analyzer
 
-Unlike static analyzers that over-resolve everything, AlgoTracer treats uncertain instance/class calls as virtual calls and resolves them safely when needed.
+AlgoTracer is a **static analysis engine** that parses Python source code, builds a structured **call graph**, identifies **static calls**, **virtual / polymorphic callsites**, and explains code behavior using a deterministic evidence-driven explainer with optional LLM reasoning layers.
 
-The explainer now emits a concise, report-style Markdown summary that blends graph evidence with light heuristics (and optionally an LLM) to describe intent.
+This is inspired by production‑grade program analyzers used in security scanning, compilers, financial trading backtest engines, and IDE intelligence systems — but purpose‑built for real‑world messy Python repos (frameworks, strategies, inheritance, duck‑typing, dynamic assignment).
 
-## 🧠 Problem & Motivation
+---
 
-Python codebases are full of calls like:
+## 1. Core Goals
 
-- `self.process()`
-- `engine.send_order()`
-- `cls.build()`
+AlgoTracer is built to answer these questions **with evidence, not guesses**:
 
-Without full type inference, resolving these statically is:
-- ❌ Wrong — you might point to the wrong function
-- ❌ Expensive — the graph explodes with edges
-- ❌ Unhelpful — too many “maybe” relationships
+- What calls what?
+- Where can control flow dynamically branch due to polymorphism?
+- Which calls are guaranteed vs. ambiguous?
+- Does a call come from inheritance, local dispatch, or attribute lookup?
+- What code paths can theoretically trigger execution?
 
-## ✔️ AlgoTracer’s Solution
-- **During ingest** → record `VirtualCall` instead of guessing
-- **During explain** → use actual class hierarchy + overrides
-- **Result** → accurate, bounded possible callees
+And most importantly:
 
-## ✅ What AlgoTracer Does
+> “If I look at a function in isolation, what is the full *truth* of how it interacts with the system?”
 
-### 1️⃣ Parse Your Python Repo
-- Scans `.py` and `.ipynb`
-- Extracts modules, classes, functions/methods, overrides, calls (deterministic + virtual), decorators
+AlgoTracer produces a **graph-backed truth layer** before ANY AI explanation happens.
 
-### 2️⃣ Build a Memgraph-First Code Graph
-Your repo becomes a compact, queryable graph.
+The LLM never invents — it only explains what evidence proves.
 
-**Node Types**
+---
 
-| Node        | Meaning                        |
-|-------------|--------------------------------|
-| Repo        | Logical repository             |
-| Module      | Python file                    |
-| Class       | Class declaration              |
-| Function    | Function or method             |
-| External    | Unresolved / outside-repo call |
-| VirtualCall | Deferred instance/class call   |
+## 2. Architecture Overview
 
-External nodes carry `name`, `namespace`, and a `category` classified as `stdlib`, `third_party`, or `unresolved`. If a call matches side-effect heuristics, the External also stores `side_effect_category`/`side_effect_confidence`/`side_effect_evidence`.
+AlgoTracer is composed of 5 main systems:
 
-**Edge Types**
+### 2.1 AST Parser
+- Walks Python files and extracts:
+  - modules
+  - classes
+  - functions
+  - method bodies
+  - imports
+  - attribute resolution context
+  - call sites
 
-| Edge          | Meaning                           |
-|---------------|-----------------------------------|
-| HAS_MODULE    | Repo → Module                     |
-| DEFINES       | Module/Class → Function           |
-| DEFINES_CLASS | Module → Class                    |
-| SUBCLASS_OF   | Class inheritance                 |
-| OVERRIDES     | Child method → Parent method      |
-| CALLS         | Deterministic call                |
-| CALLS_VIRTUAL | Uncertain / polymorphic call      |
+### 2.2 Graph Builder
+- Converts AST insights into stable node+edge structures
+- Resolves deterministic calls
+- Emits VirtualCall nodes for uncertain dispatch
+- Handles inheritance and symbol resolution
 
-### 🧩 Example — Code → Graph
+### 2.3 Memgraph Storage
+Graph persisted in Memgraph / Neo4j-style schema:
 
-**Code**
-```python
-class Base:
-    def run(self):
-        self.execute()
+| Node Type | Meaning |
+|--------|--------|
+| Module | Python file |
+| Class | Class definition |
+| Function | Top‑level or method |
+| External | Built‑ins / libs |
+| VirtualCall | Ambiguous callsite |
 
-class Child(Base):
-    def execute(self):
-        print("hi")
+| Edge | Meaning |
+|------|--------|
+| CALLS | Proven direct call |
+| CALLS_VIRTUAL | Dynamic dispatch candidate |
+| OVERRIDES | Child overrides base method |
+| IMPORTS | module import |
+
+### 2.4 Neighborhood Extractor
+For any function:
+- resolves upstream callers
+- downstream callees
+- external dependencies
+- possible virtual dispatch targets
+- supporting context nodes
+- source snippet
+
+### 2.5 Explainer Engine
+Builds a structured evidence pack.
+
+LLM can be optionally layered to generate narrative explanation while respecting rules:
+- No invented calls
+- No hallucinated code
+- No fake structure
+- MUST cite graph evidence
+
+---
+
+## 3. Static Call Resolution Model
+
+### 3.1 Deterministic Calls
+A call becomes deterministic when its target can be proven statically.
+
+Examples:
+
+```
+self.helper()
+foo.bar()
+module.function()
+MyClass.method()
 ```
 
-**Stored Graph Relationships**
-- `Class(Base) -[:DEFINES]-> Function(Base.run)`
-- `Class(Child) -[:SUBCLASS_OF]-> Class(Base)`
-- `Function(Base.run) -[:CALLS_VIRTUAL]-> VirtualCall(execute)`
-- `Function(Child.execute) -[:OVERRIDES]-> Function(Base.execute?)` (best-effort)
+AlgoTracer checks:
 
-During explanation:
-- Detects `self.execute()`
-- Sees caller belongs to `Base`
-- Walks inheritance + overrides
-- Finds `Child.execute()`
-- Returns bounded “possible callees”
+- lexical scope → local functions
+- class resolution → method table
+- inheritance relationships
+- imported references
+- explicit symbols
+- known builtin API
 
-## 🚀 Quickstart
+Result → A `CALLS` edge is emitted.
 
-1️⃣ **Start Memgraph**
-```bash
-docker run -it --rm \
-  -p 7687:7687 -p 3000:3000 \
-  memgraph/memgraph-platform
+---
+
+## 4. Virtual Calls (Polymorphism + Duck Typing)
+
+When a call target **cannot** be proven, AlgoTracer emits:
+
 ```
-- Bolt: `127.0.0.1:7687`
-- UI (optional): `http://localhost:3000`
-
-2️⃣ **Install AlgoTracer**
-```bash
-pip install -e .
+CALLS_VIRTUAL
 ```
 
-3️⃣ **Build the Graph**
-```bash
-algotracer analyze path/to/repo --repo-id my-repo
+and creates a `VirtualCall` node with metadata:
+
+- receiver root kind (self / cls / param / local)
+- full expression text
+- call attribute
+- heuristic receiver identity context
+- hash‑stable vc id
+
+Examples that become VC:
+
 ```
-Notes:
-- Skips `tests/` unless `--include-tests`
-- Supports `.ipynb` via safe conversion
-
-4️⃣ **Explain a Function**
-```bash
-algotracer explain path/to/repo \
-  --name Class.fit \
-  --file src/model.py \
-  --repo-id my-repo \
-  --output reports/explanation.md
-```
-- Uses Gemini if available (GEMINI_API_KEY + google-generativeai)
-- Otherwise deterministic summary
-- Always grounded in graph truth
-
-## 🧾 Explanation Output
-
-For each target function, the explainer produces a Markdown report:
-
-- **Header**: `Function: <qualname> (<path>:<lineno>) (node:<id>)`, `Signature: ...`
-- **Summary**: 1–2 bullets of high-level intent (**GUESS**) derived from:
-  - Target qualname and source snippet (trimmed to the function body)
-  - Neighbor semantics: caller/callee names, override relations, externals, side-effect externals
-  - Domain cues (trading, data/analytics, networking)
-- **Evidence** (all edge-backed):
-  - Upstream CALLS edges into the function (with citations)
-  - Downstream CALLS edges out of the function (with citations)
-  - Externals grouped by category (`stdlib`/`third_party`/`unresolved`, with node ids/namespaces)
-  - Overrides (OVERRIDES edges only)
-  - Side effects (explicit `side_effect_*` metadata or mutator externals)
-  - Virtual dispatch: resolved targets (CALLS_VIRTUAL + type analysis) or unresolved virtual callsites
-  - Paths (sampled upstream/downstream paths, short)
-- **Code**: trimmed source snippet of the target function (decorators included when present)
-
-LLM usage:
-- If `--no-llm` is absent and Gemini is available, `explain` will call the LLM and return its response only if it passes a strict evidence-safety gate (edge citations required for call claims). Otherwise, it falls back to the deterministic report above.
-
-## 🗺️ Graph Navigation Cheatsheet
-
-| Concept              | Graph Pattern                             |
-|----------------------|-------------------------------------------|
-| Repo structure       | `Repo -[:HAS_MODULE]-> Module`            |
-| Functions in module  | `Module -[:DEFINES]-> Function`           |
-| Class methods        | `Class -[:DEFINES]-> Function`            |
-| Inheritance          | `Class -[:SUBCLASS_OF]-> Class`           |
-| Overrides            | `Function -[:OVERRIDES]-> Function`       |
-| Deterministic call   | `Function -[:CALLS]-> Function/External`  |
-| Virtual call         | `Function -[:CALLS_VIRTUAL]-> VirtualCall`|
-
-## 🧪 CLI Reference
-
-**Analyze**
-```
-algotracer analyze <path>
-  --repo-id ID
-  --include-tests
-  --memgraph-host
-  --memgraph-port
-  --memgraph-user
-  --memgraph-password
+self.meter.update()
+target.update()
+obj.process()
+handler(x)
+plugin.run()
+strategy.execute()
 ```
 
-**Explain**
+Even better — AlgoTracer attempts to find **possible target candidates**:
+
+- sibling classes with same method
+- inherited classes
+- polymorphic interface classes
+- same‑attribute assignment tracking
+
+If found → VC is annotated:
+
 ```
-algotracer explain <path>
-  --id OR (--name + --file)
-  --depth-up
-  --depth-down
-  --max-nodes
-  --max-edges
-  --max-paths
-  --output
-  --no-llm
+vc:abc123 → [AverageMeter.update, ChartItem.update]
 ```
 
-## 📝 Notes
-- Multiple repos can coexist (unique `repo-id`)
-- Requires Memgraph running
-- Notebook parsing is sandbox-safe
-- LLM is optional
+If not → unresolved VC but still tracked.
 
-## How virtual calls are resolved (during explain)
-- Ingest stores uncertain calls as `VirtualCall` nodes instead of guessing targets.
-- `CALLS_VIRTUAL` edges originate from functions to these virtual call sites.
-- During `explain`, the neighborhood fetcher:
-  1) Collects `VirtualCall` nodes in the bounded subgraph.
-  2) Seeds possible receiver types:
-     - `self/cls/super`: uses the caller’s `owner_class` and its bases (`SUBCLASS_OF`).
-     - `name`: tries matching a class name in the repo (best-effort).
-  3) Looks up methods named `callee_attr` on those types (and bases) using `Class->Function` and `OVERRIDES`.
-  4) Returns `virtual_targets` (virtual call id + possible function ids), bounded and repo-scoped to avoid blowups.
-- Deterministic `CALLS` edges are used as-is; virtuals are expanded on demand for explanation.
+---
 
-## External call classification & side-effect signals
+## 5. Virtual Call Naming
 
-- **External categories**: every External is labeled as `stdlib`, `third_party`, or `unresolved` via `_classify_external` (import-aware).
-- **Side-effect heuristics**: common patterns are tagged with `side_effect_category` + `side_effect_confidence` (kept if unset):
-  - `io.file`, `io.file_read`, `io.file_write`
-  - `io.console`
-  - `io.network`
-  - `system.process`
-  - `external.service`
-  - `db.query`
-- The explainer surfaces these under “Side effects” and includes External names/namespaces in “Externals.”
+Instead of mysterious vc hashes, AlgoTracer names them:
 
-## Connection settings
-- Env vars: `MEMGRAPH_HOST` (default `127.0.0.1`), `MEMGRAPH_PORT` (default `7687`), `MEMGRAPH_USER`, `MEMGRAPH_PASSWORD` (optional)
-- CLI flags override env: `--memgraph-host/--memgraph-port/--memgraph-user/--memgraph-password`.
+```
+vc:a3a4db0bf2b3 [self.pos_data.items]
+vc:179d10f9269c [set().difference]
+```
+
+Sources include:
+- full expression text
+- receiver attribute pair
+- inferred root source
+
+This dramatically improves debuggability.
+
+---
+
+## 6. Explainer System
+
+The explainer constructs a deterministic structured report including:
+
+1️⃣ Function identity  
+2️⃣ What calls it  
+3️⃣ What it calls  
+4️⃣ Virtual dispatch explanation  
+5️⃣ Inheritance notes  
+6️⃣ Side effects detection  
+7️⃣ Upstream + downstream paths  
+8️⃣ Source excerpt  
+
+LLM is optional.  
+When enabled:
+- rewrites only Section 1 narrative
+- cannot change facts
+- cannot invent nodes
+- cannot fabricate calls
+
+---
+
+## 7. Stable Paths
+
+Every function is stored as:
+
+```
+stable:sym:<path>:<qualname>
+```
+
+Example:
+
+```
+stable:sym:tests/vc_test.py:Strategy.on_tick
+stable:sym:vnpy/alpha/strategy/strategies/equity_demo_strategy.py:EquityDemoStrategy.on_bars
+```
+
+This guarantees graph identity even across rebuilds.
+
+---
+
+## 8. Source Snippets
+
+AlgoTracer extracts real source from disk when explaining.
+
+- Finds owning module
+- Uses abs path or repo root
+- Captures context lines
+- Detects empty snippet cases
+- Prints debug summary
+- Injects snippet into evidence pack
+
+This enables **evidence‑anchored intent explanation**, not hallucinated descriptions.
+
+---
+
+## 9. Why This is Unique
+
+Unlike normal call graph tools which either:
+❌ Give up on Python’s dynamic nature  
+❌ Pretend uncertain calls are deterministic  
+❌ Produce useless spaghetti graphs  
+❌ Or hallucinate AI interpretations  
+
+AlgoTracer builds:
+
+- A truth graph
+- Deterministic vs uncertain separation
+- Explicitly modeled polymorphism
+- Human readable insight
+- LLM narrative only after verification
+
+This is one of the first practical **evidence‑grounded polymorphic Python analyzers** built for real systems.
+
+---
+
+## 10. Conclusion
+
+AlgoTracer makes Python call behavior:
+
+- **Visible**
+- **Structured**
+- **Provable**
+- **Explainable**
+
+It is already capable of analyzing large real‑world systems such as algorithmic trading strategies, framework internals, and highly polymorphic design architectures.
+

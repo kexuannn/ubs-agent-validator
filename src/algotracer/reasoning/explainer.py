@@ -25,7 +25,7 @@ ROLE & SOURCES OF TRUTH
 HARD RULES ABOUT CALLS
 - ALL statements about who calls whom MUST be backed by CALLS edges from the evidence.
 - NEVER describe an OVERRIDES edge as a call. OVERRIDES != CALLS.
-- Only say “X triggers Y”, “X calls Y”, or “X is invoked by Y” if there is a CALLS edge X->Y in the evidence, and you cite it as (edge:X->Y).
+- Only say “X triggers Y”, “X calls Y”, or “X is invoked by Y” if there is a CALLS edge X->Y in the evidence, and you cite it as (edge:<src>-><dst>).
 - You may describe override relationships (base vs. override) but MUST NOT say they call each other unless a CALLS edge exists.
 
 DOMAIN-AWARE INTENT (VERY IMPORTANT)
@@ -240,6 +240,7 @@ def deterministic_summary(evidence: EvidencePack) -> str:
 
     # Map vc_id -> virtual_targets entry, but only keep those with at least one internal target
     vc_with_internal: Dict[str, Dict[str, object]] = {}
+    vc_with_external: Dict[str, List[str]] = {}
     for vt in evidence.virtual_targets or []:
         vc_id = vt.get("virtual_call_id")
         if not isinstance(vc_id, str):
@@ -247,8 +248,11 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         if vc_id not in vc_ids_from_target:
             continue
         targets = [t for t in (vt.get("targets") or []) if isinstance(t, str)]
+        external_targets = [t for t in (vt.get("external_targets") or []) if isinstance(t, str)]
         if targets:
             vc_with_internal[vc_id] = {**vt, "targets": targets}
+        if external_targets:
+            vc_with_external[vc_id] = external_targets
 
     # VC sites that have INTERNAL candidate targets
     vc_resolved_targets: List[str] = []
@@ -256,11 +260,14 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         vc_resolved_targets = sorted(
             {t for vt in vc_with_internal.values() for t in vt["targets"]}  # type: ignore[index]
         )
+    vc_resolved_external: List[str] = []
+    if vc_with_external:
+        vc_resolved_external = sorted({t for targets in vc_with_external.values() for t in targets})
 
     # VC sites with NO internal candidates (and not resolved to externals)
     unresolved_vc_ids: List[str] = []
     for vc_id in vc_ids_from_target:
-        if vc_id in vc_with_internal:
+        if vc_id in vc_with_internal or vc_id in vc_with_external:
             continue
         node = nodes_by_id.get(vc_id) or {}
         full_text = node.get("full_text")
@@ -269,6 +276,30 @@ def deterministic_summary(evidence: EvidencePack) -> str:
             if edge_type.get((target_id, external_id)) == "CALLS":
                 continue
         unresolved_vc_ids.append(vc_id)
+
+    # Build a human-friendly label for each VC based on its node metadata.
+    # We prefer:
+    #   - full_text (e.g. "self.pos_data.items")
+    #   - or receiver_name.callee_attr
+    #   - or just callee_attr
+    vc_labels: Dict[str, str] = {}
+    for vc_id in vc_ids_from_target:
+        node = nodes_by_id.get(vc_id) or {}
+        label: Optional[str] = None
+
+        full_text = node.get("full_text")
+        if isinstance(full_text, str) and full_text.strip():
+            label = full_text.strip()
+        else:
+            recv = node.get("receiver_name")
+            attr = node.get("callee_attr")
+            if isinstance(recv, str) and isinstance(attr, str):
+                label = f"{recv}.{attr}"
+            elif isinstance(attr, str):
+                label = attr
+
+        if label:
+            vc_labels[vc_id] = label
 
     # 4) Inheritance / overrides (used later in facts; OVERRIDES edges only)
     ov_out, ov_in = _find_override_edges_for_target(target_id, evidence.edges)
@@ -477,26 +508,82 @@ def deterministic_summary(evidence: EvidencePack) -> str:
         else:
             lines.append("- **Side effects**: none provable from evidence.")
 
-    # Paths (sample, short) as supporting evidence
-    path_lines: List[str] = []
+    # ---------- Paths (with VirtualCall annotations) ----------
+    #
+    # We KEEP vc:<id> in the path strings, but:
+    # - If a VC has resolved targets, we rewrite it as:
+    #       vc:<id>[callsite]→[TargetFunc1, TargetFunc2, …]
+    # - If it has no internal targets, we mark it as:
+    #       vc:<id>[callsite][unresolved]
+
+    def _annotate_path(p: str) -> str:
+        out_p = p
+
+        # First, annotate resolved VCs with their INTERNAL targets
+        for vc_id, vt in vc_with_internal.items():
+            if vc_id not in out_p:
+                continue
+            target_ids = vt.get("targets") or []
+            target_ids = [t for t in target_ids if isinstance(t, str)]
+            if not target_ids:
+                continue
+
+            target_labels = [_node_label(tid) for tid in target_ids]
+            if not target_labels:
+                continue
+
+            shown = ", ".join(target_labels[:3])
+            if len(target_labels) > 3:
+                shown += ", …"
+
+            vc_label = vc_labels.get(vc_id)
+            # Example: vc:a3a4db0bf2b3[self.pos_data.items]→[EquityDemoStrategy.on_bars, …]
+            call_part = f"[{vc_label}]" if vc_label else ""
+            replacement = f"{vc_id}{call_part}→[{shown}]"
+            out_p = out_p.replace(vc_id, replacement)
+
+        # Next, annotate VCs resolved to external targets
+        for vc_id, ext_ids in vc_with_external.items():
+            if vc_id not in out_p:
+                continue
+            labels = [_node_label(eid) for eid in ext_ids if isinstance(eid, str)]
+            if not labels:
+                continue
+
+            shown = ", ".join(labels[:3])
+            if len(labels) > 3:
+                shown += ", …"
+
+            vc_label = vc_labels.get(vc_id)
+            call_part = f"[{vc_label}]" if vc_label else ""
+            replacement = f"{vc_id}{call_part}→[{shown}]"
+            out_p = out_p.replace(vc_id, replacement)
+
+        # Then, mark any remaining VCs as unresolved, but still show the callsite name if we know it.
+        for vc_id in unresolved_vc_ids:
+            if vc_id and vc_id in out_p:
+                vc_label = vc_labels.get(vc_id)
+                call_part = f"[{vc_label}]" if vc_label else ""
+                out_p = out_p.replace(vc_id, f"{vc_id}{call_part}[unresolved]")
+
+        return out_p
+
+    def _non_empty_paths(paths: List[str]) -> List[str]:
+        return [p for p in paths if p.strip()]
+
+    upstream_paths = _non_empty_paths(upstream_paths)
+    downstream_paths = _non_empty_paths(downstream_paths)
+
     if upstream_paths:
-        for p in upstream_paths[:3]:
-            path_lines.append(f"  - Upstream path: `{p}`")
+        lines.append("- **Upstream paths**:")
+        for p in upstream_paths:
+            lines.append(f"  - `{_annotate_path(p)}`")
+
     if downstream_paths:
-        resolved_vc_ids = set(vc_ids_from_target) - set(unresolved_vc_ids)
+        lines.append("- **Downstream paths**:")
+        for p in downstream_paths:
+            lines.append(f"  - `{_annotate_path(p)}`")
 
-        def _path_has_resolved_vc(path: str) -> bool:
-            return any(vc_id in path for vc_id in resolved_vc_ids)
-
-        filtered_downstream = [
-            p for p in downstream_paths if not _path_has_resolved_vc(p)
-        ]
-        for p in filtered_downstream[:3]:
-            path_lines.append(f"  - Downstream path: `{p}`")
-
-    if path_lines:
-        lines.append("- **Paths (samples)**:")
-        lines.extend(path_lines)
     lines.append("")
 
     # ---------- Section 4: Code excerpt ----------

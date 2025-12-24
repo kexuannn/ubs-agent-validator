@@ -18,6 +18,7 @@ from algotracer.graph.resolver import (
 from algotracer.ingest.ast_parser import parse_python_files
 from algotracer.memgraph.client import MemgraphConfig, clear_repo, connect_memgraph, ensure_schema
 from algotracer.reasoning.explainer import build_gemini_llm, evidence_from_neighborhood, explain
+from algotracer.graph.cypher import generate_cypher
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,9 @@ class AlgoTracerPipeline:
         output_path = config.output_path or (config.repo_path / "reports" / "explanation.md")
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(result, encoding="utf-8")
+
+        # Export neighborhood as Cypher alongside the report
+        generate_cypher(neighborhood, output_path.parent)
 
         return result
 
