@@ -91,6 +91,25 @@ def resolve_by_name(
     return _fetch_candidates(mg, query, {"repo_id": repo_id, "qualname": qualname})
 
 
+def resolve_by_path_and_lineno(
+    mg: Memgraph,
+    repo_id: str,
+    path: str,
+    lineno: int,
+) -> List[FunctionCandidate]:
+    query = (
+        "MATCH (f:Function {repo_id: $repo_id, path: $path, lineno: $lineno}) "
+        "OPTIONAL MATCH (c)-[:CALLS {repo_id: $repo_id}]->(f) "
+        "RETURN f.id AS id, f.path AS path, f.qualname AS qualname, f.name AS name, "
+        "f.lineno AS lineno, f.kind AS kind, f.signature AS signature, count(c) AS callers"
+    )
+    return _fetch_candidates(
+        mg,
+        query,
+        {"repo_id": repo_id, "path": path, "lineno": lineno},
+    )
+
+
 def disambiguate(candidates: List[FunctionCandidate]) -> FunctionCandidate | None:
     if not candidates:
         return None

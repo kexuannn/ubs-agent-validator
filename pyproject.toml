@@ -8,6 +8,18 @@ requires-python = ">=3.10"
 dependencies = [
     "gqlalchemy",
     "python-dotenv",
+    "langchain",
+    "langchain-community",
+    "langchain-text-splitters",
+    "langgraph",
+    "langgraph-api",
+    "langgraph-cli",
+    "langsmith",
+    "langchain-huggingface",
+    "langchain-openai",
+    "sentence-transformers",
+    "faiss-cpu",
+    "protobuf>=5.26.1,<6",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +38,7 @@ packages = [
     "algotracer.analysis",
     "algotracer.reasoning",
     "algotracer.memgraph",
+    "algotracer.rag",
 ]
 
 [tool.setuptools.package-data]

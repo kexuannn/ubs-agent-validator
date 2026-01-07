@@ -26,6 +26,7 @@ class AnalyzeConfig:
     repo_path: Path
     repo_id: str
     include_tests: bool = False
+    rag_config: "RagConfig | None" = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +71,11 @@ class AlgoTracerPipeline:
         )
 
         print(f"AlgoTracer: graph written to Memgraph for repo_id={config.repo_id}.")
+
+        if config.rag_config is not None:
+            from algotracer.rag.indexer import build_rag_index
+
+            build_rag_index(modules, config=config.rag_config)
 
     def explain(self, config: ExplainConfig) -> str:
         mg = connect_memgraph(self.memgraph_config)

@@ -55,7 +55,9 @@ class CallInfo:
 class FunctionInfo:
     name: str
     lineno: int
+    end_lineno: int | None = None
     signature: str | None = None
+    docstring: str | None = None
     params: Set[str] = field(default_factory=set)
     assigned_locals: Set[str] = field(default_factory=set)  # local variable names
     calls: Set[str] = field(default_factory=set)
@@ -75,10 +77,12 @@ class FunctionInfo:
 class ClassInfo:
     name: str
     lineno: int
+    end_lineno: int | None = None
     bases: List[str] = field(default_factory=list)  # list of base class names (for inheritance tracing)
     methods: List[FunctionInfo] = field(default_factory=list)
     # NEW: inferred/annotated types for self/cls attributes on this class
     field_types: dict[str, str] = field(default_factory=dict)
+    docstring: str | None = None
 
 
 @dataclass
@@ -149,10 +153,12 @@ class _SymbolVisitor(ast.NodeVisitor):
         func = FunctionInfo(
             name=node.name,
             lineno=node.lineno,
+            end_lineno=getattr(node, "end_lineno", None),
             signature=_format_signature(node),
             decorators=decos,
             params=params,
         )
+        func.docstring = ast.get_docstring(node)
         func.param_type_hints = param_type_hints
 
         calls, details = _collect_calls(node, current_class=self._current_class_name())
@@ -186,9 +192,11 @@ class _SymbolVisitor(ast.NodeVisitor):
         cls = ClassInfo(
             name=node.name,
             lineno=node.lineno,
+            end_lineno=getattr(node, "end_lineno", None),
             bases=[_base_name(base) for base in node.bases],
         )
         cls.field_types = field_collector.field_types
+        cls.docstring = ast.get_docstring(node)
 
         self._class_stack.append(cls)
         self.generic_visit(node)

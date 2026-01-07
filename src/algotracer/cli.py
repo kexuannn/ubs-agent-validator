@@ -10,6 +10,7 @@ from pathlib import Path
 
 from algotracer.memgraph.client import MemgraphConfig
 from algotracer.pipeline import AlgoTracerPipeline, AnalyzeConfig, ExplainConfig
+from algotracer.rag.config import RagConfig
 
 
 def _add_memgraph_flags(parser: argparse.ArgumentParser) -> None:
@@ -37,6 +38,16 @@ def build_parser() -> argparse.ArgumentParser:
     analyze.add_argument("repo_path", type=Path, help="Repository root to analyze")
     analyze.add_argument("--repo-id", default=None, help="Override repo_id (default: repo folder name)")
     analyze.add_argument("--include-tests", action="store_true", help="Include files under tests/")
+    analyze.add_argument("--rag", action="store_true", help="Build RAG index after analysis")
+    analyze.add_argument("--rag-index", type=Path, default=None, help="RAG index path (default: .algotracer_rag)")
+    analyze.add_argument("--rag-chunk-size", type=int, default=1200, help="RAG chunk size (default: 1200)")
+    analyze.add_argument("--rag-chunk-overlap", type=int, default=150, help="RAG chunk overlap (default: 150)")
+    analyze.add_argument(
+        "--rag-embed-model",
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="Embedding model name",
+    )
+    analyze.add_argument("--rag-no-docs", action="store_true", help="Disable indexing Markdown docs")
     _add_memgraph_flags(analyze)
 
     explain = sub.add_parser("explain", help="Explain a function neighborhood from Memgraph")
@@ -72,11 +83,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "analyze":
         repo_path: Path = args.repo_path
         repo_id = args.repo_id or repo_path.resolve().name
+        rag_config = None
+        if args.rag:
+            rag_config = RagConfig(
+                repo_root=repo_path,
+                index_path=args.rag_index or (repo_path / ".algotracer_rag"),
+                embedding_model=args.rag_embed_model,
+                chunk_size=args.rag_chunk_size,
+                chunk_overlap=args.rag_chunk_overlap,
+                include_docs=not args.rag_no_docs,
+            )
         pipeline.analyze(
             AnalyzeConfig(
                 repo_path=repo_path,
                 repo_id=repo_id,
                 include_tests=args.include_tests,
+                rag_config=rag_config,
             )
         )
         return 0

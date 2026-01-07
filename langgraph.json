@@ -1,0 +1,8 @@
+{
+  "dependencies": [
+    "."
+  ],
+  "graphs": {
+    "algotracer_chat": "src/algotracer/rag/langgraph_app.py:graph"
+  }
+}
